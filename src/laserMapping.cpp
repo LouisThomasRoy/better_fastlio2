@@ -7,6 +7,8 @@
 #include <ikd-Tree/ikd_Tree.h>
 #include "IMU_Processing.hpp"
 
+#include <gtsam/navigation/GPSFactor.h>
+
 #include"sc-relo/Scancontext.h"
 #include"dynamic-remove/tgrs.h"
 
@@ -209,6 +211,342 @@ Eigen::MatrixXd poseCovariance;
 
 ros::Publisher pubLaserCloudSurround;
 ros::Publisher pubOptimizedGlobalMap; // 发布最后优化的地图
+
+/*------------------------------------------------------------------ GNSS ----
+ * Global position factors, filling in the `// addGPSFactor(); // TODO: GPS`
+ * that upstream left in saveKeyFramesAndFactor(). Ported from LIO-SAM's
+ * addGPSFactor(), with the three changes this dataset needs:
+ *
+ *  1. LIO-SAM expects GPS already expressed in the odometry frame -- that is
+ *     what robot_localization's navsat_transform_node hands it. Here the input
+ *     is raw local ENU while FAST-LIO's world frame is the first IMU body
+ *     frame: arbitrary yaw, arbitrary origin. So the ENU->map rigid transform
+ *     is estimated online from the first stretch of travel and every fix is
+ *     mapped through it. The graph therefore stays in the frame the ikd-tree
+ *     map is built in and is never rotated globally mid-run.
+ *
+ *     Any yaw error in that transform is a pure gauge choice, not an error, so
+ *     long as the first pose is left free -- see the prior in addOdomFactor().
+ *     The same transform is written to map_from_enu.txt and inverted on output,
+ *     so it cancels exactly.
+ *
+ *  2. The antenna sits 1.09 m from the IMU, which is as large as the GPS error
+ *     itself, so the lever arm is removed through the keyframe's own attitude.
+ *
+ *  3. The receiver is DGPS/SBAS (status 2, sigma ~0.5 m), and its error is a
+ *     smooth correlated bias rather than white noise. Treating every fix as
+ *     independent would over-count its information, so factors are spaced in
+ *     SECONDS (gnssFactorInterval) rather than added at every keyframe, and
+ *     carry a Cauchy kernel. Spacing in seconds also keeps the density
+ *     invariant to keyframeAddingDistThreshold.
+ *
+ * COUPLING. better_fastlio2 is tightly coupled backwards: saveKeyFramesAndFactor
+ * pushes the optimised pose back into the ESKF (kf.change_x) and correctPoses
+ * rebuilds the ikd-tree from graph poses. That is sound when the only global
+ * factor is loop closure, which fires rarely and re-anchors the map to geometry
+ * the scan matcher can actually see. It is NOT sound for GNSS: a 0.5 m-accurate
+ * global sensor nudging a 2 cm-accurate scan matcher ten times a second leaves
+ * the ESKF matching against an ikd-tree built in the frame it has just been
+ * pulled out of, and the front-end fights it. Measured on featuresAndGps: the
+ * front-end alone is ATE 0.676 m / RPE 0.189 m, and tightly coupled GNSS makes
+ * it 0.913 / 0.503 -- worse than adding no GNSS at all.
+ *
+ * So with gnssLooseCoupling the backend becomes a pure consumer:
+ *   - the odometry factor is built from FRONT-END to FRONT-END poses, a real
+ *     relative motion, instead of upstream's graph-pose-to-ESKF-pose mix (which
+ *     is only a relative motion because the feedback keeps the frames equal);
+ *   - kf.change_x is never called, so the ESKF runs undisturbed FAST-LIO2;
+ *   - the ikd-tree is never reconstructed from graph poses, which would splice a
+ *     corrected map under an uncorrected filter.
+ * The published trajectory is the graph's, so loop closure and GNSS both still
+ * reach the output. This is exactly what the two-stage pipeline did -- the point
+ * here is that it now happens in one pass, in one process.
+ *
+ * LIO-SAM additionally gates on the pose covariance exceeding a threshold, so
+ * that GPS is only used once the LiDAR solution has become uncertain. That is
+ * deliberately not ported: it is an online-SLAM heuristic for a system whose
+ * odometry is trusted by default, and here the whole point is a globally
+ * bounded offline product. The measured sweep in README.md says denser is
+ * monotonically better down to one factor per keyframe.
+ */
+bool gnssEnable = false;
+string gnss_topic = "/gps/odom_enu";
+float gnssFactorInterval = 1.0;   // s between GNSS factors
+float gnssAlignDistance = 30.0;   // m of travel before the ENU->map fit is solved
+int gnssAlignMinFixes = 20;       // and at least this many correspondences
+float gnssMaxTimeDiff = 0.10;     // s, largest keyframe-to-fix gap tolerated
+float gnssMaxSigma = 5.0;         // m, reject fixes reporting worse than this
+float gnssCauchyWidth = 1.5;      // m, Cauchy kernel width; <= 0 disables
+bool gnssFreeGauge = true;        // leave x/y/z/yaw of pose 0 nearly unconstrained
+bool gnssLooseCoupling = true;    // keep backend corrections out of the ESKF; see below
+vector<double> gnssLeverArm(3, 0.0); // antenna position in the IMU/body frame
+
+struct GnssFix
+{
+    double t;
+    Eigen::Vector3d enu;   // east, north, up relative to the first valid fix
+    Eigen::Vector3d sigma; // per-axis standard deviation, metres
+};
+
+std::deque<GnssFix> gnssQueue; // filled by the callback
+std::mutex mtx_gnss;
+std::vector<GnssFix> gnssBuf;    // received fixes, time-ordered, kept for interpolation
+std::deque<int> gnssPendingKeys; // keyframes picked for a factor, awaiting a bracketing fix
+std::vector<int> gnssAlignKeys;  // correspondences held back until the fit is solved
+std::vector<Eigen::Vector3d> gnssAlignEnu;
+std::vector<Eigen::Vector3d> gnssAlignSigma;
+double gnssLastSelected = -1e18;
+bool gnssAligned = false;
+bool aGnssIsAdded = false;
+Eigen::Matrix3d gnssRme = Eigen::Matrix3d::Identity(); // R_map_enu
+Eigen::Vector3d gnssTme = Eigen::Vector3d::Zero();     // t_map_enu
+bool gnssJustAligned = false; // one-shot: force an ikd-tree rebuild after the fit
+gtsam::Pose3 gnssLastFrontendPose;  // ESKF pose at the previous keyframe (loose coupling)
+bool gnssHaveFrontendPose = false;
+// The FRONT-END's own pose per keyframe, kept in parallel with cloudKeyPoses3D/6D.
+// Under loose coupling the graph poses and the ESKF's poses are different things,
+// and the ikd-tree is the ESKF's map: it has to be rebuilt in the ESKF's frame.
+pcl::PointCloud<PointType>::Ptr gnssFePoses3D(new pcl::PointCloud<PointType>());
+pcl::PointCloud<PointTypePose>::Ptr gnssFePoses6D(new pcl::PointCloud<PointTypePose>());
+double gnssAlignYaw = 0.0, gnssAlignRms = 0.0, gnssAlignPath = 0.0;
+int gnssFactorCount = 0, gnssRejectCount = 0;
+
+void gnss_cbk(const nav_msgs::Odometry::ConstPtr &msg)
+{
+    GnssFix f;
+    f.t = msg->header.stamp.toSec();
+    f.enu << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
+    // The converter writes lon_err^2, lat_err^2 and (2 max(lat,lon))^2 into the
+    // diagonal; the floor keeps a zero-filled covariance from producing an
+    // infinitely stiff factor.
+    f.sigma << std::sqrt(std::max(msg->pose.covariance[0], 1e-4)),
+        std::sqrt(std::max(msg->pose.covariance[7], 1e-4)),
+        std::sqrt(std::max(msg->pose.covariance[14], 1e-4));
+    mtx_gnss.lock();
+    gnssQueue.push_back(f);
+    mtx_gnss.unlock();
+}
+
+// 把回调缓存搬进有序数组,用于插值
+void gnssDrainQueue()
+{
+    mtx_gnss.lock();
+    while (!gnssQueue.empty())
+    {
+        const GnssFix &f = gnssQueue.front();
+        if (gnssBuf.empty() || f.t > gnssBuf.back().t)
+            gnssBuf.push_back(f);
+        gnssQueue.pop_front();
+    }
+    mtx_gnss.unlock();
+}
+
+// 0 = ok, 1 = no usable fix at that instant, 2 = fix not received yet, retry later
+int gnssInterp(double t, Eigen::Vector3d &enu, Eigen::Vector3d &sigma)
+{
+    if (gnssBuf.empty() || t > gnssBuf.back().t)
+        return 2; // the bag has not reached this instant yet
+    size_t hi = std::lower_bound(gnssBuf.begin(), gnssBuf.end(), t,
+                                 [](const GnssFix &a, double v) { return a.t < v; }) -
+                gnssBuf.begin();
+    if (hi == 0)
+    {
+        if (gnssBuf.front().t - t > gnssMaxTimeDiff)
+            return 1; // keyframe predates the first fix
+        enu = gnssBuf.front().enu;
+        sigma = gnssBuf.front().sigma;
+        return 0;
+    }
+    const GnssFix &a = gnssBuf[hi - 1];
+    const GnssFix &b = gnssBuf[hi];
+    if (b.t - a.t > 2.0 * gnssMaxTimeDiff)
+    {
+        // a real dropout in the fix stream: fall back to the nearer end if it is
+        // close enough, rather than interpolating across the hole
+        const GnssFix &n = (t - a.t < b.t - t) ? a : b;
+        if (std::fabs(n.t - t) > gnssMaxTimeDiff)
+            return 1;
+        enu = n.enu;
+        sigma = n.sigma;
+        return 0;
+    }
+    double u = (t - a.t) / std::max(b.t - a.t, 1e-9);
+    enu = a.enu + u * (b.enu - a.enu);
+    sigma = a.sigma + u * (b.sigma - a.sigma);
+    return 0;
+}
+
+void gnssWriteTransform()
+{
+    std::ofstream f(rootDir + "map_from_enu.txt");
+    if (!f)
+        return;
+    f << std::setprecision(12);
+    f << "# T_map_enu: p_map = R p_enu + t.  Yaw-only rotation about z.\n";
+    f << "# Apply the INVERSE to put transformations.pcd back into the local ENU\n";
+    f << "# frame whose origin is the first valid GNSS fix of this sequence.\n";
+    f << "# This is a rigid change of coordinates, not an optimisation: the pose\n";
+    f << "# graph already ran with the GNSS factors in it.\n";
+    f << "aligned " << (gnssAligned ? 1 : 0) << "\n";
+    f << "yaw " << gnssAlignYaw << "\n";
+    f << "R";
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            f << " " << gnssRme(r, c);
+    f << "\n";
+    f << "t " << gnssTme(0) << " " << gnssTme(1) << " " << gnssTme(2) << "\n";
+    f << "align_fixes " << gnssAlignKeys.size() << "\n";
+    f << "align_path " << gnssAlignPath << "\n";
+    f << "align_rms " << gnssAlignRms << "\n";
+    f << "factors " << gnssFactorCount << "\n";
+    f << "rejected " << gnssRejectCount << "\n";
+    f.close();
+}
+
+// 用已有的关键帧位姿与GNSS对应点求解 ENU->map 的yaw+平移
+bool gnssSolveAlignment()
+{
+    const size_t n = gnssAlignKeys.size();
+    if (n < (size_t)gnssAlignMinFixes)
+        return false;
+
+    // Predicted ANTENNA position in the map frame, so the lever arm is handled
+    // without needing the alignment we are about to solve for.
+    std::vector<Eigen::Vector3d> A(n), B(n);
+    Eigen::Vector3d lever(gnssLeverArm[0], gnssLeverArm[1], gnssLeverArm[2]);
+    Eigen::Vector3d ca = Eigen::Vector3d::Zero(), cb = Eigen::Vector3d::Zero();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const PointTypePose &kp = cloudKeyPoses6D->points[gnssAlignKeys[i]];
+        gtsam::Pose3 T = pclPointTogtsamPose3(kp);
+        A[i] = T.translation() + T.rotation().matrix() * lever;
+        B[i] = gnssAlignEnu[i];
+        ca += A[i];
+        cb += B[i];
+    }
+    ca /= double(n);
+    cb /= double(n);
+
+    // 2D Procrustes: the yaw that rotates the ENU track onto the map track.
+    // Yaw only, not full SE(3): with a 30 m baseline the roll/pitch of a rigid
+    // fit would be noise, and the residual tilt between the two frames (FAST-LIO
+    // starts in the initial IMU body frame, level to ~0.6 deg here) is left for
+    // the graph to absorb through the vertical GNSS channel.
+    double sxx = 0.0, sxy = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        Eigen::Vector2d a = A[i].head<2>() - ca.head<2>();
+        Eigen::Vector2d b = B[i].head<2>() - cb.head<2>();
+        sxx += b.x() * a.x() + b.y() * a.y();
+        sxy += b.x() * a.y() - b.y() * a.x();
+    }
+    if (std::hypot(sxx, sxy) < 1e-6)
+        return false;
+    gnssAlignYaw = std::atan2(sxy, sxx);
+    const double cy = std::cos(gnssAlignYaw), sy = std::sin(gnssAlignYaw);
+    gnssRme << cy, -sy, 0.0, sy, cy, 0.0, 0.0, 0.0, 1.0;
+    gnssTme = ca - gnssRme * cb;
+
+    double se = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        se += (gnssRme * B[i] + gnssTme - A[i]).squaredNorm();
+    gnssAlignRms = std::sqrt(se / double(n));
+    gnssAligned = true;
+
+    printf("\033[1;32m[GNSS] ENU->map solved from %zu fixes over %.1f m: yaw %+.3f deg, rms %.3f m\033[0m\n",
+           n, gnssAlignPath, gnssAlignYaw * 180.0 / M_PI, gnssAlignRms);
+    gnssWriteTransform();
+    return true;
+}
+
+// 把一个GNSS观测加入因子图
+void gnssAddOne(int key, const Eigen::Vector3d &enu, const Eigen::Vector3d &sigma)
+{
+    gtsam::Pose3 T = pclPointTogtsamPose3(cloudKeyPoses6D->points[key]);
+    Eigen::Vector3d lever(gnssLeverArm[0], gnssLeverArm[1], gnssLeverArm[2]);
+    // GPSFactor constrains the pose translation, i.e. the IMU origin, so the
+    // antenna offset has to come off the measurement first.
+    Eigen::Vector3d target = gnssRme * enu + gnssTme - T.rotation().matrix() * lever;
+
+    // The measurement covariance is diagonal in ENU; rotate it into the map
+    // frame rather than assuming it is isotropic (lat_err ~0.5-0.7 m against
+    // lon_err ~0.4 m, so it is not).
+    Eigen::Matrix3d C = Eigen::Matrix3d::Zero();
+    C(0, 0) = sigma(0) * sigma(0);
+    C(1, 1) = sigma(1) * sigma(1);
+    C(2, 2) = sigma(2) * sigma(2);
+    C = gnssRme * C * gnssRme.transpose();
+
+    gtsam::SharedNoiseModel model = gtsam::noiseModel::Gaussian::Covariance(C);
+    if (gnssCauchyWidth > 0.0)
+        model = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Cauchy::Create(gnssCauchyWidth), model);
+
+    gtSAMgraph.add(gtsam::GPSFactor(key, gtsam::Point3(target(0), target(1), target(2)), model));
+    gnssFactorCount++;
+    aGnssIsAdded = true;
+}
+
+// 添加GNSS因子
+void addGPSFactor()
+{
+    if (!gnssEnable)
+        return;
+    gnssDrainQueue();
+
+    // addOdomFactor() has just inserted this key; cloudKeyPoses3D/6D do not carry
+    // it until after the isam update below, which is why selection and use are
+    // separated by the pending queue.
+    const int newKey = (int)cloudKeyPoses3D->size();
+    if (lidar_end_time - gnssLastSelected >= gnssFactorInterval)
+    {
+        gnssPendingKeys.push_back(newKey);
+        gnssLastSelected = lidar_end_time;
+    }
+
+    while (!gnssPendingKeys.empty())
+    {
+        const int key = gnssPendingKeys.front();
+        if (key >= (int)cloudKeyPoses6D->size())
+            break; // pose not committed yet; it will be on the next keyframe
+        Eigen::Vector3d enu, sigma;
+        const int st = gnssInterp(cloudKeyPoses6D->points[key].time, enu, sigma);
+        if (st == 2)
+            break; // fix has not arrived yet, keep it pending
+        gnssPendingKeys.pop_front();
+        if (st == 1 || sigma.head<2>().maxCoeff() > gnssMaxSigma)
+        {
+            gnssRejectCount++;
+            continue;
+        }
+
+        if (!gnssAligned)
+        {
+            if (!gnssAlignEnu.empty())
+                gnssAlignPath += (enu - gnssAlignEnu.back()).norm();
+            gnssAlignKeys.push_back(key);
+            gnssAlignEnu.push_back(enu);
+            gnssAlignSigma.push_back(sigma);
+            if (gnssAlignPath >= gnssAlignDistance && gnssSolveAlignment())
+            {
+                // The correspondences held back during alignment are still valid
+                // constraints, so add them now rather than throwing away the
+                // first 30 m of GNSS.
+                for (size_t i = 0; i < gnssAlignKeys.size(); ++i)
+                    gnssAddOne(gnssAlignKeys[i], gnssAlignEnu[i], gnssAlignSigma[i]);
+                // This is the one moment the solution moves by a non-trivial jump
+                // (the fit residual, ~0.1-0.6 m) rather than by centimetres, so the
+                // ikd-tree is left describing the old frame. Flag it; the rebuild is
+                // armed in saveKeyFramesAndFactor, where updateKdtreeCount is
+                // already declared.
+                gnssJustAligned = true;
+            }
+            continue;
+        }
+        gnssAddOne(key, enu, sigma);
+    }
+}
+
 
 bool recontructKdTree = false;
 int updateKdtreeCount = 0;        // 每100次更新一次
@@ -528,7 +866,16 @@ bool saveFrame()
         return true;
 
     // 前一帧位姿,注:最开始没有的时候,在函数extractCloud里面有
-    Eigen::Affine3f transStart = pclPointToAffine3f(cloudKeyPoses6D->back());
+    // Same frame-mixing trap as addOdomFactor(): cloudKeyPoses6D->back() is a GRAPH
+    // pose while transformTobeMapped is an ESKF pose. Under loose coupling the two
+    // drift apart, so the "increment" would include the accumulated GNSS correction
+    // and trigger keyframes on motion that never happened -- measured: 894
+    // keyframes at a 1.0 m threshold where the frame-consistent version gives 445.
+    Eigen::Affine3f transStart;
+    if (gnssEnable && gnssLooseCoupling && gnssHaveFrontendPose)
+        transStart = Eigen::Affine3f(gnssLastFrontendPose.matrix().cast<float>());
+    else
+        transStart = pclPointToAffine3f(cloudKeyPoses6D->back());
     // 当前帧位姿
     Eigen::Affine3f transFinal = trans2Affine3f(transformTobeMapped);
     // 位姿变换增量
@@ -553,7 +900,26 @@ void addOdomFactor()
     if (cloudKeyPoses3D->points.empty())
     {
         // 给出一个噪声模型,也就是协方差矩阵
-        gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12).finished());
+        // Upstream pins pose 0 rigidly (1e-12 on all six). That is right when the
+        // graph has no global sensor: the first keyframe simply defines the frame.
+        // With GNSS in the graph it is wrong. The ENU->map transform in
+        // addGPSFactor() is fitted from a 30 m baseline, so its yaw carries a few
+        // milliradians of error; against a pinned origin that error becomes real
+        // distortion growing with distance from the fit (~1 m at 200 m). Left free,
+        // it is only a gauge choice -- the graph settles onto the GNSS targets and
+        // the inverse transform removes it again on output.
+        //
+        // So: roll and pitch stay tight, because gravity observes them and the
+        // vertical GNSS channel is far too weak to; x, y, z and yaw are handed to
+        // GNSS. This is LIO-SAM's prior, and its variances.
+        gtsam::Vector6 priorVar;
+        if (gnssEnable && gnssFreeGauge)
+            priorVar << 1e-2, 1e-2, M_PI * M_PI, 1e8, 1e8, 1e8;
+        else
+            priorVar << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12;
+        gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances(priorVar);
+        gnssLastFrontendPose = trans2gtsamPose(transformTobeMapped);
+        gnssHaveFrontendPose = true;
         // 加入先验因子PriorFactor,固定这个顶点,对第0个节点增加约束
         gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
         // 节点设置初始值,将这个顶点的值加入初始值中
@@ -567,13 +933,33 @@ void addOdomFactor()
     {
         // 添加激光里程计因子
         gtsam::noiseModel::Diagonal::shared_ptr odometryNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
-        gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back()); // 上一个位姿
-        gtsam::Pose3 poseTo = trans2gtsamPose(transformTobeMapped);                   // 当前位姿
-        gtsam::Pose3 relPose = poseFrom.between(poseTo);
-        // 参数:前一帧id;当前帧id;前一帧与当前帧的位姿变换poseFrom.between(poseTo) = poseFrom.inverse()*poseTo;噪声协方差;
-        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(cloudKeyPoses3D->size() - 1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
+        gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back()); // 上一个位姿(graph)
+        gtsam::Pose3 poseTo = trans2gtsamPose(transformTobeMapped);                   // 当前位姿(ESKF)
+        gtsam::Pose3 relPose;
+        gtsam::Pose3 initGuess;
+        if (gnssEnable && gnssLooseCoupling)
+        {
+            // Both ends from the ESKF, so this really is the motion the front-end
+            // measured. Upstream's poseFrom.between(poseTo) mixes a graph pose with
+            // an ESKF pose; that is only a relative motion while kf.change_x keeps
+            // the two frames identical. Once the graph carries GNSS and the ESKF is
+            // left alone, the difference between them is the whole accumulated
+            // correction, and upstream's form would re-inject it into every edge --
+            // dragging each new pose back onto the raw FAST-LIO trajectory at
+            // sigma = 1 cm / 1 mrad, undoing GNSS as fast as it is applied.
+            relPose = gnssLastFrontendPose.between(poseTo);
+            initGuess = poseFrom * relPose; // chain from the graph, not the ESKF
+        }
+        else
+        {
+            relPose = poseFrom.between(poseTo);
+            initGuess = poseTo;
+        }
+        // 参数:前一帧id;当前帧id;前一帧与当前帧的位姿变换;噪声协方差;
+        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(cloudKeyPoses3D->size() - 1, cloudKeyPoses3D->size(), relPose, odometryNoise));
         // 变量节点设置初始值,将这个顶点的值加入初始值中
-        initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
+        initialEstimate.insert(cloudKeyPoses3D->size(), initGuess);
+        gnssLastFrontendPose = poseTo;
 
         writeVertex(cloudKeyPoses3D->size(), poseTo, vertices_str);
         writeEdge({cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size()}, relPose, edges_str); 
@@ -613,6 +999,23 @@ void recontructIKdTree()
 {
     if (updateKdtreeCount == kd_step)  
     {
+        // Which poses describe the map we are rebuilding? Upstream uses the graph's,
+        // because upstream keeps the ESKF glued to the graph. Under loose coupling
+        // it does not, and rebuilding the front-end's local map from GNSS-corrected
+        // poses would splice a corrected map underneath an uncorrected filter. The
+        // periodic rebuild itself is NOT optional, though -- it is what bounds and
+        // refreshes the local map, and dropping it diverged the front-end on twigs
+        // (the fastest sequence) at t = 217 s, running the trajectory out to 2434 m
+        // against a true 162 m. So: same rebuild, front-end poses.
+        const bool useFe = gnssEnable && gnssLooseCoupling;
+        pcl::PointCloud<PointType>::Ptr srcPoses3D = useFe ? gnssFePoses3D : cloudKeyPoses3D;
+        pcl::PointCloud<PointTypePose>::Ptr srcPoses6D = useFe ? gnssFePoses6D : cloudKeyPoses6D;
+        // Return without touching updateKdtreeCount, so the next call retries. Doing
+        // the trailing ++ here instead would push the counter past kd_step and the
+        // == test would never match again, silently disabling every later rebuild.
+        if (srcPoses3D->empty())
+            return;
+
         /*** if path is too large, the rviz will crash ***/
         pcl::KdTreeFLANN<PointType>::Ptr kdtreeGlobalMapPoses(new pcl::KdTreeFLANN<PointType>());
         pcl::PointCloud<PointType>::Ptr subMapKeyPoses(new pcl::PointCloud<PointType>());
@@ -624,12 +1027,12 @@ void recontructIKdTree()
         std::vector<int> pointSearchIndGlobalMap;
         std::vector<float> pointSearchSqDisGlobalMap;
         mtx.lock();
-        kdtreeGlobalMapPoses->setInputCloud(cloudKeyPoses3D);
-        kdtreeGlobalMapPoses->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+        kdtreeGlobalMapPoses->setInputCloud(srcPoses3D);
+        kdtreeGlobalMapPoses->radiusSearch(srcPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
         mtx.unlock();
 
         for (int i = 0; i < (int)pointSearchIndGlobalMap.size(); ++i)
-            subMapKeyPoses->push_back(cloudKeyPoses3D->points[pointSearchIndGlobalMap[i]]); // subMap的pose集合
+            subMapKeyPoses->push_back(srcPoses3D->points[pointSearchIndGlobalMap[i]]); // subMap的pose集合
         // 降采样
         pcl::VoxelGrid<PointType> downSizeFilterSubMapKeyPoses;
         downSizeFilterSubMapKeyPoses.setLeafSize(globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity); // for global map visualization
@@ -639,11 +1042,11 @@ void recontructIKdTree()
         for (int i = 0; i < (int)subMapKeyPosesDS->size(); ++i)
         {
             // 距离过大
-            if (pointDistance(subMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
+            if (pointDistance(subMapKeyPosesDS->points[i], srcPoses3D->back()) > globalMapVisualizationSearchRadius)
                 continue;
             int thisKeyInd = (int)subMapKeyPosesDS->points[i].intensity;
             // *globalMapKeyFrames += *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
-            *subMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
+            *subMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &srcPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
         }
         // 降采样，发布
         pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames;      // for global map visualization
@@ -686,7 +1089,8 @@ void saveKeyFramesAndFactor()
     // 激光里程计因子(from fast-lio)
     addOdomFactor();
 
-    // addGPSFactor();   // TODO: GPS
+    // GNSS因子
+    addGPSFactor();
 
     // 回环因子
     addLoopFactor();
@@ -702,6 +1106,19 @@ void saveKeyFramesAndFactor()
         isam->update();
         isam->update();
         isam->update();
+    }
+    else if (aGnssIsAdded == true){
+        // A GNSS factor is a gentle sub-metre nudge, not a topology change, so one
+        // extra pass is enough. Spending a loop closure's five on it every second
+        // would dominate the runtime at a 0.25 m keyframe spacing.
+        isam->update();
+    }
+
+    // A GNSS correction has to reach the historical poses and the ESKF exactly the
+    // way a loop closure does, so reuse that path rather than duplicating it.
+    if (aGnssIsAdded == true){
+        aLoopIsClosed = true;
+        aGnssIsAdded = false;
     }
     
     // update之后要清空一下保存的因子图,注:清空不会影响优化,ISAM保存起来了
@@ -722,21 +1139,62 @@ void saveKeyFramesAndFactor()
     thisPose3D.z = latestEstimate.translation().z();
     // 其中索引作为intensity
     thisPose3D.intensity = cloudKeyPoses3D->size(); // 使用intensity作为该帧点云的index
-    cloudKeyPoses3D->push_back(thisPose3D);         // 新关键帧帧放入队列中
     // 同样6D的位姿也保存下来
     thisPose6D.x = thisPose3D.x;
     thisPose6D.y = thisPose3D.y;
     thisPose6D.z = thisPose3D.z;
 
-    // TODO:
-    thisPose3D.z = 0.0; // FIXME: right?
-
+    // Upstream has `thisPose3D.z = 0.0;  // FIXME: right?` here. It is DEAD there:
+    // cloudKeyPoses3D->push_back(thisPose3D) has already happened by this point, so
+    // the flattened z never reaches the cloud. Moving the push below the lock would
+    // have made it live, which would zero the height used by
+    // detectLoopClosureDistance's radius search and silently break loop closure on
+    // any sequence with vertical relief -- ditches drives on side slopes. Deleted
+    // rather than relocated: it changes nothing against upstream, and leaving it
+    // next to the push is a trap.
     thisPose6D.intensity = thisPose3D.intensity;
     thisPose6D.roll = latestEstimate.rotation().roll();
     thisPose6D.pitch = latestEstimate.rotation().pitch();
     thisPose6D.yaw = latestEstimate.rotation().yaw();
     thisPose6D.time = lidar_end_time;
+
+    // The keyframe cloud is built here, before the pose is published, so that all
+    // three containers can be appended under one lock. performLoopClosure() copies
+    // cloudKeyPoses3D/6D under mtx and then indexes surfCloudKeyFrames with
+    // copy_cloudKeyPoses6D->size() - 1 (loopFindNearKeyframes, detectLoop-
+    // ClosureDistance). Upstream pushes the pose clouds here and the keyframe
+    // cloud ~20 lines below, so a copy taken in that window sees one more pose
+    // than there are clouds and the loop thread reads past the end of
+    // surfCloudKeyFrames. That is a real segfault -- it killed a 1.0 m-keyframe
+    // run at keyframe 393 -- and the GNSS path makes it far easier to hit, since
+    // correctPoses() now also touches these containers about once a second.
+    pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+    pcl::copyPointCloud(*feats_undistort, *thisSurfKeyFrame); // 存储关键帧,没有降采样的点云
+
+    // The same keyframe expressed in the front-end's frame, for the ikd-tree rebuild.
+    PointTypePose fePose6D;
+    PointType fePose3D;
+    {
+        const gtsam::Point3 fp = gnssLastFrontendPose.translation();
+        const gtsam::Rot3 fr = gnssLastFrontendPose.rotation();
+        fePose3D.x = fePose6D.x = fp.x();
+        fePose3D.y = fePose6D.y = fp.y();
+        fePose3D.z = fePose6D.z = fp.z();
+        fePose3D.intensity = fePose6D.intensity = thisPose3D.intensity;
+        fePose6D.roll = fr.roll();
+        fePose6D.pitch = fr.pitch();
+        fePose6D.yaw = fr.yaw();
+        fePose6D.time = lidar_end_time;
+    }
+
+    mtx.lock();
+    cloudKeyPoses3D->push_back(thisPose3D); // 新关键帧帧放入队列中
     cloudKeyPoses6D->push_back(thisPose6D);
+    surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+    gnssFePoses3D->push_back(fePose3D);
+    gnssFePoses6D->push_back(fePose6D);
+    mtx.unlock();
+
     // 保存当前位姿的位姿协方差（置信度）
     poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size() - 1);
 
@@ -748,18 +1206,31 @@ void saveKeyFramesAndFactor()
     // 更新状态量
     state_updated.pos = pos;
     state_updated.rot = q;
-    state_point = state_updated; // 对state_point进行更新,state_point可视化用到
+    // state_point is NOT just for visualisation, whatever the comment says: the main
+    // loop calls map_incremental() right after this, and that uses state_point
+    // (through pointBodyToWorld) to decide where in the ikd-tree the current scan's
+    // points belong. Overwriting it with the graph pose under loose coupling inserts
+    // every keyframe's points at a pose the ESKF is not at, so the map the scan
+    // matcher works against drifts away from the filter that is matching to it. That
+    // is what diverged twigs -- the fastest, sparsest sequence -- at t = 217 s, out
+    // to a 1975 m trajectory against a true 162 m, while pure FAST-LIO2 at the same
+    // 0.25 m keyframe spacing runs it cleanly at 159.2 m.
+    if (!(gnssEnable && gnssLooseCoupling))
+        state_point = state_updated; // 对state_point进行更新
 
-    if(aLoopIsClosed == true)
+    // Under loose coupling the ESKF is never told about the backend: it runs plain
+    // FAST-LIO2 and addOdomFactor() takes its relative motion from front-end poses
+    // only. Feeding a 0.5 m GNSS solution into a 2 cm scan matcher measurably
+    // wrecks it (featuresAndGps RPE 0.189 -> 0.503).
+    if (aLoopIsClosed == true && !(gnssEnable && gnssLooseCoupling))
         kf.change_x(state_updated); // 对cur_pose进行isam2优化后的修正
-
-    pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
-    pcl::copyPointCloud(*feats_undistort, *thisSurfKeyFrame); // 存储关键帧,没有降采样的点云
-    surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
     updatePath(thisPose6D); // 可视化update后的最新位姿 
 
+    gnssJustAligned = false;
+
     // 清空局部map, reconstruct  ikdtree submap
+    // (recontructIKdTree picks graph or front-end poses itself; see the note there)
     if (recontructKdTree){
         recontructIKdTree();
     }
@@ -777,6 +1248,14 @@ void correctPoses()
         globalPath.poses.clear();
         // 更新因子图中所有变量节点的位姿,也就是所有历史关键帧的位姿
         int numPoses = isamCurrentEstimate.size();
+        // performLoopClosure() copies both clouds under mtx and then does a kdtree
+        // search and an ICP against the copy, so rewriting them here without the
+        // lock lets it work from a half-updated set of poses. Upstream gets away
+        // with it because this only ran on a loop closure; GNSS factors set
+        // aLoopIsClosed roughly once a second, which makes the window far easier
+        // to hit. recontructIKdTree() below takes mtx itself, so the lock has to
+        // end before it -- std::mutex is not recursive.
+        mtx.lock();
         for (int i = 0; i < numPoses; ++i)
         {
             cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().x();
@@ -793,9 +1272,13 @@ void correctPoses()
             // 更新里程计轨迹
             updatePath(cloudKeyPoses6D->points[i]);
         }
+        mtx.unlock();
 
-        // 清空局部map, reconstruct  ikdtree submap
-        if (recontructKdTree){
+        // 清空局部map, reconstruct  ikdtree submap.
+        // Skipped under loose coupling: correctPoses() exists to push a backend
+        // correction into the map, and that is exactly what must not happen here.
+        // The periodic rebuild in saveKeyFramesAndFactor still runs.
+        if (recontructKdTree && !(gnssEnable && gnssLooseCoupling)){
             recontructIKdTree();
         }
         
@@ -1751,6 +2234,17 @@ bool saveMapService(fast_lio_sam::save_mapRequest &req, fast_lio_sam::save_mapRe
     // 保存历史关键帧位姿
     pcl::io::savePCDFileBinary(rootDir + "trajectory.pcd", *cloudKeyPoses3D);      // 关键帧位置
     pcl::io::savePCDFileBinary(rootDir + "transformations.pcd", *cloudKeyPoses6D); // 关键帧位姿
+    if (gnssEnable)
+    {
+        gnssWriteTransform();
+        cout << "GNSS: " << gnssFactorCount << " factors, " << gnssRejectCount
+             << " rejected, aligned=" << gnssAligned << " (rms " << gnssAlignRms
+             << " m over " << gnssAlignPath << " m)" << endl;
+        if (!gnssAligned)
+            cout << "\033[1;31mWARNING: the ENU->map fit never converged, so NO GNSS "
+                    "factor was added and the output stays in the arbitrary LiDAR "
+                    "frame.\033[0m" << endl;
+    }
     // 提取历史关键帧角点、平面点集合
     //   pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
     //   pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
@@ -2073,6 +2567,24 @@ int main(int argc, char **argv)
     nh.param<float>("segment/z_tollerance", z_tollerance, 1.0);
     nh.param<float>("segment/rotation_tollerance", rotation_tollerance, 0.2);
     
+    // gnss
+    nh.param<bool>("gnss/enable", gnssEnable, false);
+    nh.param<string>("gnss/topic", gnss_topic, "/gps/odom_enu");
+    nh.param<float>("gnss/factorInterval", gnssFactorInterval, 1.0);
+    nh.param<float>("gnss/alignDistance", gnssAlignDistance, 30.0);
+    nh.param<int>("gnss/alignMinFixes", gnssAlignMinFixes, 20);
+    nh.param<float>("gnss/maxTimeDiff", gnssMaxTimeDiff, 0.10);
+    nh.param<float>("gnss/maxSigma", gnssMaxSigma, 5.0);
+    nh.param<float>("gnss/cauchyWidth", gnssCauchyWidth, 1.5);
+    nh.param<bool>("gnss/freeGauge", gnssFreeGauge, true);
+    nh.param<bool>("gnss/looseCoupling", gnssLooseCoupling, true);
+    nh.param<vector<double>>("gnss/leverArm", gnssLeverArm, vector<double>(3, 0.0));
+    if (gnssLeverArm.size() != 3)
+    {
+        ROS_WARN("gnss/leverArm needs three numbers, got %zu; using zero", gnssLeverArm.size());
+        gnssLeverArm.assign(3, 0.0);
+    }
+
     // loop clousre
     nh.param<bool>("loop/loopClosureEnableFlag", loopClosureEnableFlag, true);
     nh.param<float>("loop/loopClosureFrequency", loopClosureFrequency, 1.0);
@@ -2180,6 +2692,19 @@ int main(int argc, char **argv)
     // std::cout << repub_topic << std::endl;
     ros::Subscriber sub_pcl = p_pre->lidar_type == LIVOX ? (p_pre->livox_type == LIVOX_CUS ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(repub_topic, 200000, livox_ros_cbk)) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    // Declared out here, not inside an if: a ros::Subscriber unsubscribes when it
+    // goes out of scope (which is exactly what silently breaks the camera path
+    // twenty lines below).
+    ros::Subscriber sub_gnss;
+    if (gnssEnable)
+    {
+        sub_gnss = nh.subscribe(gnss_topic, 200000, gnss_cbk);
+        cout << "GNSS factors enabled, subscribing " << gnss_topic << endl;
+        if (gnssLooseCoupling)
+            cout << "GNSS loose coupling: the ESKF is NOT corrected by the backend and "
+                    "the ikd-tree is NOT rebuilt from graph poses. The published "
+                    "trajectory is the pose graph's." << endl;
+    }
     // ros::Subscriber subLivoxMsg = nh.subscribe<livox_ros_driver::CustomMsg>(lid_topic, 100000, LivoxRepubCallback);
     
     if (camera_en){
