@@ -2,6 +2,19 @@ cmake_minimum_required(VERSION 3.10)
 
 project(fast_lio_sam)
 
+# Default to a Release build.
+#
+# Without this, a plain `catkin build` configures with an empty CMAKE_BUILD_TYPE,
+# i.e. -O0, and the failure mode is silent rather than loud: the mapping node
+# runs several times slower than real time, falls behind `rosbag play`, and
+# /save_map then writes a TRUNCATED trajectory instead of erroring. Measured on
+# the Charlie8 `field` sequence (154 s, 1540 scans): 0.37 s of processing per
+# 0.10 s scan at -O0, and 477 keyframes covering 47.6 s of the run.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING
+      "Build type (Release is required for the node to keep real time)" FORCE)
+endif()
+
 # Set the C++17 standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
