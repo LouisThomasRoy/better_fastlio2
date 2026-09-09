@@ -104,6 +104,11 @@ In rough order of frequency, all covered in the guide's troubleshooting section:
 5. **rviz** — X11 permissions, or GPU driver mismatch inside the container.
    `xhost +local:docker`, then `LIBGL_ALWAYS_SOFTWARE=1` if it is still unhappy.
 6. **OOM during `catkin build`** on 8 GB laptops with `-j$(nproc)`.
+7. **A slow machine.** The node has to keep real time against `rosbag play`; if
+   it cannot, `/save_map` writes a truncated trajectory and nothing errors. The
+   package now defaults to a Release build for this reason, but a laptop under
+   load can still fall behind. The tell is `ave total` > 0.1 in the
+   `[ Mapping Time ]` lines, and a span in step 10 shorter than the sequence.
 
 The one that is not their fault and looks like it is: the node **wipes its output
 directory at startup** (`fsmkdir()` → `fs::remove_all()`). A student who re-runs

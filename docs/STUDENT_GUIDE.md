@@ -297,6 +297,12 @@ translation unit full of Eigen and PCL templates.
 > compiler process can take over a gigabyte, and if the kernel's OOM killer
 > stops one you get a confusing "signal 9" error rather than a clear message.
 
+The build is a **Release** build — `CMakeLists.txt` defaults to it. That is not a
+detail: at `-O0` this node runs about four times slower than real time, and the
+way you find out is not an error but a trajectory that quietly stops a third of
+the way through the sequence. If you ever build it elsewhere, pass
+`--cmake-args -DCMAKE_BUILD_TYPE=Release` yourself.
+
 When it succeeds, tell your current shell where the result is:
 
 ```bash
@@ -367,6 +373,11 @@ Now watch terminal 1 and rviz. You should see:
   a message about the GNSS alignment being solved.
 
 `field` plays for 154 seconds in real time. Let it finish.
+
+Terminal 1 prints a `[ Mapping Time ]` line per scan. The `ave total` field is
+seconds of processing per 0.1 s scan — it should sit **well under 0.1**. If it
+is larger, the node is falling behind the bag and will end up with a trajectory
+shorter than the sequence.
 
 > **Do not add `--clock` to `rosbag play`**, and do not set `use_sim_time`. The
 > node's main loop sleeps on wall time; under simulated time those sleeps never
@@ -450,7 +461,9 @@ python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
 ```
 
 Sanity checks first: `field` should report about **1500 poses, 154 s, ~215 m**.
-A path length that is wildly wrong — 20 m, or 2000 m — means the run diverged.
+Check all three. A span much shorter than 154 s means the node fell behind and
+the trajectory is truncated; a path length that is wildly wrong — 20 m, or
+2000 m — means the run diverged.
 
 If your instructor gave you reference trajectories, compare against one:
 
@@ -537,6 +550,13 @@ start again without.
 The node was killed before the call, or the call errored. Check terminal 1.
 Remember the node wipes its output directory at startup, so a *previous* run's
 files are gone by then too.
+
+**The trajectory is much shorter than the sequence**
+The node fell behind `rosbag play` and `/save_map` captured only what it had
+finished. Check `ave total` in terminal 1 (see step 8) and confirm the build is
+a Release build:
+`grep CMAKE_BUILD_TYPE /catkin_ws/build/fast_lio_sam/CMakeCache.txt`.
+Close other heavy applications and re-run — the node has to keep real time.
 
 **The trajectory is ten times too long, or wanders off**
 Usually the wrong sequence config, or a bag that is not one of the seven. Check
