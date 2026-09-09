@@ -290,8 +290,9 @@ catkin build fast_lio_sam -j"$(nproc)"
 `fast_lio_sam` is the *package* name — `better_fastlio2` is only the folder the
 repository lives in. You will see this mismatch again in step 8.
 
-This compiles for 5–15 minutes. `laserMapping.cpp` alone is a 2500-line
-translation unit full of Eigen and PCL templates.
+This compiles for 3–15 minutes depending on how many cores you have.
+`laserMapping.cpp` alone is a 2500-line translation unit full of Eigen and PCL
+templates.
 
 > **8 GB of RAM or less:** use `-j4` instead of `-j"$(nproc)"`. Each parallel
 > compiler process can take over a gigabyte, and if the kernel's OOM killer
@@ -472,10 +473,11 @@ python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
     /output/field/ground_truth.tum --compare /datasets/reference/field.tum
 ```
 
-Expect an RMSE of a few centimetres up to about 0.2 m. It will **not** be zero:
-the node is not deterministic — thread scheduling changes which scans arrive
-together — so two runs of the same sequence differ slightly. Agreement well
-under a metre is a pass.
+Expect an RMSE of a few centimetres — a clean `field` run lands around 0.05 m
+against the reference, with a worst-case pose error near 0.13 m. It will **not**
+be zero: the node is not deterministic — thread scheduling changes which scans
+arrive together — so two runs of the same sequence differ slightly. Agreement
+well under a metre is a pass.
 
 For the four sequences that return to their starting point (`ditches`,
 `featuresAndGps`, `insideGarage`, `niceFeatures`), add `--loop` to see how far

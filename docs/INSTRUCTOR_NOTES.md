@@ -122,11 +122,23 @@ A correct `field` run gives roughly:
 ground_truth.tum: ~1500 poses, 154.0 s, ~215 m
 ```
 
-Against a reference trajectory, ATE RMSE should be a few centimetres up to about
-0.2 m. It is **not** reproducible to the digit — the node is not deterministic
-under OpenMP and real-time playback, and repeat runs of the same sequence move
-the ENU→map fit rms by ~0.08 m. Do not grade on an exact match; grade on
-path length, pose count, and agreement well under a metre.
+Against the reference trajectory, ATE RMSE should be a few centimetres. A
+verified `field` run through exactly the steps in the guide gave:
+
+```
+ground_truth.tum: 1536 poses, 153.5 s, 215.9 m
+  vs reference (1536 matched)   rmse  0.046  med  0.031  p95  0.084  max  0.126 m
+  vs reference RPE @ 10s        rmse  0.037  med  0.014  p95  0.098  max  0.170 m
+```
+
+It is **not** reproducible to the digit — the node is not deterministic under
+OpenMP and real-time playback, and repeat runs of the same sequence move the
+ENU→map fit rms by ~0.08 m. Do not grade on an exact match; grade on pose count,
+span, path length, and agreement well under a metre.
+
+For reference on timing: in a Release build the node reports `ave total` around
+0.015 s per 0.1 s scan, i.e. seven times faster than real time, so there is
+plenty of headroom on a student laptop.
 
 A good written question, answerable from the config comments alone: *why is loop
 closure disabled on every sequence except `insideGarage`?*
