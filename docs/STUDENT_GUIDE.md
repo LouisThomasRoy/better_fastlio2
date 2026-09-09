@@ -172,7 +172,7 @@ You do not need all seven. `field` is the quickest way to a result;
 
 ```bash
 cd ~/slam/catkin_ws/src
-git clone https://github.com/<GITHUB-USER>/better_fastlio2.git
+git clone https://github.com/LouisThomasRoy/better_fastlio2.git
 cd better_fastlio2
 ```
 

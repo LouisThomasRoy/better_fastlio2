@@ -6,7 +6,7 @@ the things in it that are easy to get wrong from the other side of the desk.
 ## Before the first session
 
 **Replace the placeholder repository URL.** The guide clones from
-`https://github.com/<GITHUB-USER>/better_fastlio2.git`. Once the fork exists:
+`https://github.com/LouisThomasRoy/better_fastlio2.git`. Once the fork exists:
 
 ```bash
 grep -rl '<GITHUB-USER>' . | xargs sed -i 's|<GITHUB-USER>|your-github-username|g'
