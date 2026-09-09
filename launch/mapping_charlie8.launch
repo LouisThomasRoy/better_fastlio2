@@ -1,0 +1,83 @@
+<launch>
+    <!-- better_fastlio2 + GNSS on the Charlie8 dataset.
+
+         Expects a ROS 1 bag containing /ouster0 (Velodyne point layout) and
+         /imu, plus /gps/odom_enu when GNSS is enabled.
+
+         Typical use, from inside the container:
+
+           terminal 1:  roslaunch fast_lio_sam mapping_charlie8.launch seq:=field
+           terminal 2:  rosbag play /datasets/field.bag
+                        # wait ~30 s after it ends for the backend to settle
+                        rosservice call /save_map "{resolution: 0.0, destination: ''}"
+
+         insideGarage is the one sequence with no GNSS fix, so it swaps the two
+         global constraints around:
+
+           roslaunch fast_lio_sam mapping_charlie8.launch seq:=insideGarage \
+               gnss:=false loop:=true
+    -->
+
+    <arg name="rviz"   default="true"/>
+    <arg name="seq"    default="field"/>
+    <arg name="config" default="$(find fast_lio_sam)/config/charlie8_gnss.yaml"/>
+    <!-- Where results go. /output is a bind mount from the host; see
+         docker/charlie8/README.md. -->
+    <arg name="outdir" default="/output"/>
+    <!-- "config" leaves gnss/enable to whatever the config file says. "true" or
+         "false" overrides it, which is how insideGarage runs without needing a
+         second config file. -->
+    <arg name="gnss"   default="config"/>
+    <!-- Same three-way switch for loop closure. GNSS and better_fastlio2's ICP
+         loop factors are ALTERNATIVES, not complements: with both enabled the
+         solution satisfies neither. charlie8_gnss.yaml therefore ships with
+         GNSS on and loop closure off; insideGarage inverts both. -->
+    <arg name="loop"   default="config"/>
+
+    <rosparam command="load" file="$(arg config)"/>
+
+    <!-- Override rootDir per sequence. Must come AFTER the rosparam load, which
+         sets it to the shared default in the config file.
+
+         DANGER: laserMapping.cpp calls fsmkdir(rootDir), and fsmkdir
+         (common_lib.h) does fs::remove_all() on the directory if it already
+         exists before recreating it. rootDir is WIPED on every node start.
+         Never point it at anything you want to keep. In particular, never point it at
+         the folder holding your bags. -->
+    <param name="common/rootDir" type="string" value="$(arg outdir)/$(arg seq)/"/>
+
+    <group unless="$(eval arg('gnss') == 'config')">
+        <param name="gnss/enable" type="bool" value="$(arg gnss)"/>
+    </group>
+    <group unless="$(eval arg('loop') == 'config')">
+        <param name="loop/loopClosureEnableFlag" type="bool" value="$(arg loop)"/>
+    </group>
+
+    <param name="feature_extract_enable"  type="bool"   value="false"/>
+    <param name="point_filter_num"        type="int"    value="3"/>
+    <param name="max_iteration"           type="int"    value="4"/>
+    <param name="filter_size_surf"        type="double" value="0.3"/>
+    <param name="filter_size_map"         type="double" value="0.3"/>
+    <param name="cube_side_length"        type="double" value="1500"/>
+    <param name="runtime_pos_log_enable"  type="bool"   value="true"/>
+    <param name="pcd_save_enable"         type="bool"   value="true"/>
+
+    <!-- use_sim_time is deliberately NOT set, and the bag must be played with no
+         'clock' flag. The main loop is ros::Rate rate(5000) + rate.sleep(), and
+         the loop-closure thread does the same. Under sim time the /clock topic
+         stops advancing the moment the bag ends, so those sleeps never return,
+         ros::spinOnce() is never reached again, and the /save_map service is
+         never serviced, so the run hangs and you lose the trajectory. The
+         estimator reads message header stamps, not ros::Time::now(), so wall
+         time is fine. -->
+
+    <!-- The catkin package is fast_lio_sam; better_fastlio2 is only the repo
+         directory name. The mapping target is fastlio_sam_mapping. -->
+    <node pkg="fast_lio_sam" type="fastlio_sam_mapping" name="laserMapping"
+          output="screen" required="true"/>
+
+    <group if="$(arg rviz)">
+        <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+              args="-d $(find fast_lio_sam)/rviz_cfg/loam_livox.rviz"/>
+    </group>
+</launch>

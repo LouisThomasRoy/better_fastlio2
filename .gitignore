@@ -1,0 +1,13 @@
+# catkin generates these next to src/, but people do build inside the package too
+build/
+devel/
+logs/
+install/
+.catkin_tools/
+
+# run outputs
+*.pcd
+!pic/*.pcd
+Log/*.txt
+__pycache__/
+*.pyc

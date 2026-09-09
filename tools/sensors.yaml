@@ -1,0 +1,29 @@
+lidar0:
+  sensor: Ouster OS1-32
+  p_vehicle2sensor_vehicle: [-0.634, 1.196, 1.053]
+  euler_vehicle_sensor: [0.00099, 0.0, -0.00457]
+lidar1:
+  sensor: Ouster OS1-32
+  p_vehicle2sensor_vehicle: [0.633, 1.210, 1.067]
+  euler_vehicle_sensor: [-0.00098, 0.0, 0.00457]
+radar0:
+  sensor: Smartmicro UMRR-96 TYPE 153
+  p_vehicle2sensor_vehicle: [0.76, 1.09, 0.84]
+  euler_vehicle_sensor: [0.0, 0.0, -1.047]
+radar1:
+  sensor: Smartmicro UMRR-96 TYPE 153
+  p_vehicle2sensor_vehicle: [-0.76, 1.09, 0.84]
+  euler_vehicle_sensor: [0.0, 0.0, 1.047]
+radar2:
+  sensor: Smartmicro UMRR-11 TYPE 132
+  p_vehicle2sensor_vehicle: [0.0, 1.50, 0.85]
+  euler_vehicle_sensor: [0.0, 0.0, 0.0]
+imu:
+  sensor: XSENS MTI-200-2A8G4
+  p_vehicle2sensor_vehicle: [0.0, -0.13, 0.7125]
+  euler_vehicle_sensor: "unknown"
+gps:
+  sensor: NovAtel PwrPak7
+  p_vehicle2sensor_vehicle: [0.54, 0.735, 1.12]
+
+  

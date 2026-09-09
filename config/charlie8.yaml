@@ -1,0 +1,128 @@
+# better_fastlio2 configuration for the Charlie8 radar dataset.
+#
+# Input is produced by preproc/db3_to_ros1.py, which emits /ouster0 in the
+# Velodyne point layout (x, y, z, intensity, time [s], ring [uint16]) with
+# non-finite points removed, and /imu with a Madgwick orientation and real
+# covariances.
+#
+# Frames: everything is expressed in the IMU frame, which is the vehicle frame
+# (x-right, y-forward, z-up) since R_vehicle_imu is identity. FAST-LIO estimates
+# gravity itself, so the non-REP-103 axis order costs nothing here -- it only
+# means the output trajectory's x axis points right rather than forward.
+
+common:
+    lid_topic:  "/ouster0"
+    imu_topic:  "/imu"
+    camera_topic: "/usb_cam/image_raw"     # unused, camera_en is false
+    time_sync_en: false                    # lidar and imu share one clock already:
+                                           # bag timestamps equal header stamps exactly
+
+    rootDir: "/output/"
+    # Off on purpose: we want the trajectory, not the map. map_save_en makes the
+    # node accumulate every undistorted point for the whole run (~30M on field,
+    # more on ditches) and dump it at shutdown, costing a lot of RAM and time.
+    # transformations.pcd comes from cloudKeyPoses6D and is written regardless.
+    savePCD: false
+    savePCDDirectory: "PCDs/"
+    saveSCD: false
+    saveSCDDirectory: "SCDs/"
+    saveLOG: true
+    saveLOGDirectory: "LOG/"
+    map_save_en: false
+    pcd_save_interval: 1
+
+preprocess:
+    lidar_type: 2         # 2 = Velodyne layout, which is what the converter emits
+    livox_type: 1         # unused
+    scan_line:  32        # OS1-32; rowIdx spans 0..31 and the handler drops ring >= scan_line
+    blind: 1.5            # the other lidar and the vehicle body sit inside ~1.5 m
+    feature_enabled: 0    # FAST-LIO2 style direct point-to-plane, no feature extraction
+    point_filter_num: 3   # keep every 3rd point; ~24k pts/scan is plenty
+    scan_rate: 10
+    # NOTE: the key is time_unit, NOT times_unit. laserMapping.cpp:2041 reads
+    # "preprocess/time_unit" and defaults to US. The shipped config/velodyne16.yaml
+    # writes "times_unit", which silently does nothing -- so that config runs on the
+    # US default. Our converter emits per-point time in seconds, so this must be 0.
+    time_unit: 0          # 0=sec 1=ms 2=us 3=ns
+
+camera:
+    camera_en: false
+    camera_external: [ 1.0, 0.0, 0.0, 0.0,
+                       0.0, 1.0, 0.0, 0.0,
+                       0.0, 0.0, 1.0, 0.0,
+                       0.0, 0.0, 0.0, 1.0]
+    camera_internal: [ 1.0, 0.0, 0.0, 0.0,
+                       0.0, 1.0, 0.0, 0.0,
+                       0.0, 0.0, 1.0, 0.0]
+
+mapping:
+    # XSENS MTI-200 process noise. Deliberately looser than the datasheet values
+    # the converter writes into the message covariances: these are the ESIKF's
+    # process noise and want headroom for unmodelled vibration on a field vehicle.
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    180.0
+    det_range:     100.0          # OS1-32 practical range
+    cube_len: 1500
+    extrinsic_est_en: false       # extrinsics are surveyed and validated to ~5 cm
+                                  # (ground plane lands at z = 0 +/- 0.07 m)
+    mappingSurfLeafSize: 0.2
+    keyframeAddingDistThreshold: 1.0
+    keyframeAddingAngleThreshold: 0.2
+
+    # T_imu_lidar0, from preproc/extrinsics.py.
+    #   t = p_vehicle2lidar0 - p_vehicle2imu = [-0.634, 1.196, 1.053] - [0, -0.13, 0.7125]
+    #   R = Rz(-0.00457) Ry(0) Rx(0.00099)
+    # Cross-check: the same derivation reproduces radar0_config.yaml's l_b_r exactly.
+    extrinsic_T: [ -0.634000, 1.326000, 0.340500 ]
+    extrinsic_R: [  0.999989558,  0.004569982, -0.000004524,
+                   -0.004569984,  0.999989068, -0.000989990,
+                    0.000000000,  0.000990000,  0.999999510 ]
+
+ikdtree:
+    max_iteration: 4
+    recontructKdTree: true        # offline run, we can afford it
+    kd_step: 30
+    filter_size_map_min: 0.2
+
+loop:
+    # Four sequences return to their start (ditches, featuresAndGps, insideGarage,
+    # niceFeatures) and this is the only global constraint available for
+    # insideGarage, which has no GNSS fix at all.
+    loopClosureEnableFlag: true
+    # 5 Hz, not the stock 1 Hz. detectLoopClosureDistance only ever examines the
+    # newest keyframe (loopKeyCur = copy_cloudKeyPoses3D->size() - 1), so the
+    # detection rate has to exceed the keyframe rate or keyframes are skipped
+    # permanently. field produced 219 keyframes in 148.5 s (~1.5 Hz), so at 1 Hz
+    # roughly a third were never loop-checked. 5 Hz gives every keyframe ~3
+    # chances. Cheap: the kdtree radius search exits immediately when there is no
+    # spatial candidate, and loopIndexContainer caches keyframes already closed.
+    loopClosureFrequency: 5.0
+    historyKeyframeSearchRadius: 12.0
+    historyKeyframeSearchTimeDiff: 30.0
+    historyKeyframeSearchNum: 3
+    historyKeyframeFitnessScore: 0.25
+
+segment:
+    # Ground segmentation is off: ditches deliberately drives on side slopes, so a
+    # flat-ground prior is wrong there, and we want one config across all seven
+    # sequences rather than per-sequence special cases.
+    ground_en: false
+    tollerance_en: false
+    sensor_height: 1.053          # lidar0 height above ground, from sensors.yaml
+    z_tollerance: 2.0
+    rotation_tollerance: 0.2
+
+publish:
+    path_en: true
+    scan_publish_en: true
+    dense_publish_en: false
+    scan_bodyframe_pub_en: true
+
+visualization:
+    globalMapVisualizationSearchRadius: 20.0
+    globalMapVisualizationPoseDensity: 0.5
+    globalMapVisualizationLeafSize: 0.2
+    visulize_IkdtreeMap: false    # headless by default

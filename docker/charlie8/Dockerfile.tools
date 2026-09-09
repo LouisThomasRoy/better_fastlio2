@@ -1,0 +1,15 @@
+# Preprocessing, GNSS anchoring and evaluation. No ROS install needed: the .db3
+# bags are read directly (their custom message definitions are embedded), and
+# ROS 1 bags are written with the pure-Python `rosbags` library.
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /ws
+CMD ["bash"]

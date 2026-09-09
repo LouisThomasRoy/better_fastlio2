@@ -1,0 +1,11 @@
+# numpy is pinned below 2.0 on purpose: the gtsam 4.2 wheels on PyPI are built
+# against the numpy 1.x C ABI. With numpy 2.x, `import gtsam` succeeds but the
+# first call that crosses the boundary with an ndarray segfaults (exit 139) with
+# no Python traceback. Verified on numpy 2.4.6.
+numpy>=1.24,<2
+scipy>=1.11,<1.14
+PyYAML>=6.0
+rosbags>=0.9.20
+gtsam==4.2
+evo>=1.28
+matplotlib>=3.8,<3.10
