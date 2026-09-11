@@ -4,10 +4,6 @@ From a bare Ubuntu machine to a finished ground truth trajectory. No ROS
 experience needed. Everything except Docker itself lives in the container.
 Should take around 2h to install for the first time.
 
-Check Docker works before you start: `docker run --rm hello-world`. If that says
-`permission denied ... docker.sock`, you're not in the `docker` group yet:
-`sudo usermod -aG docker $USER`, then log out and back in.
-
 ---
 
 ## What you're building
@@ -33,7 +29,22 @@ as *ground truth* for testing other algorithms.
 
 ---
 
-## 1. Make your folders
+## 1. Check Docker
+
+```bash
+docker run --rm hello-world
+```
+
+A greeting means you're set. `permission denied ... docker.sock` means you're not
+in the `docker` group yet: `sudo usermod -aG docker $USER`, then log out and back
+in.
+
+If there's no `docker` command at all, install it first:
+<https://docs.docker.com/engine/install/ubuntu/>
+
+---
+
+## 2. Make your folders
 
 ```bash
 mkdir -p ~/slam/catkin_ws/src ~/slam/datasets ~/slam/output
@@ -52,7 +63,7 @@ the container exiting and you can edit the code in your normal editor.
 
 ---
 
-## 2. Copy the data in
+## 3. Copy the data in
 
 ```bash
 cp /path/to/usb/*.bag ~/slam/datasets/
@@ -69,11 +80,11 @@ GNSS receiver.
 | `ditches` | 387 s | 458 m | yes | longest, driven along side slopes |
 | `mixOfNicefeaturesAndOpenSpace` | 238 s | 215 m | yes | |
 | `twigs` | 254 s | 162 m | yes | fastest driving |
-| `insideGarage` | 227 s | 232 m | **none** | indoors, no GNSS fix. Runs differently, see step 7 |
+| `insideGarage` | 227 s | 232 m | **none** | indoors, no GNSS fix. Runs differently, see step 8 |
 
 ---
 
-## 3. Clone the pipeline
+## 4. Clone the pipeline
 
 ```bash
 cd ~/slam/catkin_ws/src
@@ -87,11 +98,11 @@ GNSS work added.
 
 ⚠️ Clone it **inside `catkin_ws/src/`**. catkin only looks for packages under
 `src/`, so anywhere else builds nothing and you get "package not found" in
-step 7.
+step 8.
 
 ---
 
-## 4. Build the container image
+## 5. Build the container image
 
 From inside the repo:
 
@@ -114,7 +125,7 @@ image.
 
 ---
 
-## 5. Start the container
+## 6. Start the container
 
 ```bash
 xhost +local:docker          # let the container draw rviz on your screen
@@ -139,8 +150,8 @@ docker run -it --rm \
 | `--net=host` | ROS nodes talk over TCP; this saves a lot of hassle |
 | `--shm-size=2g` | ROS moves point clouds through shared memory, 64 MB isn't enough |
 | `-e DISPLAY` + `/tmp/.X11-unix` | the two halves of "rviz can open a window" |
-| `-v ~/slam/...:/...` | the folders from step 1. **This is the passthrough:** `/datasets` in the container *is* `~/slam/datasets` outside |
-| `:ro` | dataset mount read-only, so nothing inside can wreck your data. See step 7 |
+| `-v ~/slam/...:/...` | the folders from step 2. **This is the passthrough:** `/datasets` in the container *is* `~/slam/datasets` outside |
+| `:ro` | dataset mount read-only, so nothing inside can wreck your data. See step 8 |
 | `--device /dev/dri` | gives rviz your GPU. Drop it if it errors and rviz falls back to software rendering |
 
 Later on, `./docker/charlie8/run_container.sh` does all of that, and opens
@@ -148,7 +159,7 @@ another shell if the container is already up.
 
 ---
 
-## 6. Compile the SLAM code
+## 7. Compile the SLAM code
 
 ```bash
 cd /catkin_ws
@@ -158,7 +169,7 @@ rospack find fast_lio_sam        # /catkin_ws/src/better_fastlio2
 ```
 
 The *package* is `fast_lio_sam`; `better_fastlio2` is just the folder. You'll hit
-that again in step 7.
+that again in step 8.
 
 3 to 15 minutes depending on cores. **With 8 GB of RAM or less use `-j4`** — each
 compiler process can take over a gigabyte, and an OOM kill shows up as a cryptic
@@ -174,7 +185,7 @@ fine until you check its length. I lost a run to this.
 
 ---
 
-## 7. Run it
+## 8. Run it
 
 ### Look at the data
 
@@ -258,7 +269,7 @@ the comments in `config/charlie8_gnss.yaml`.
 
 ---
 
-## 8. Make a trajectory file
+## 9. Make a trajectory file
 
 `transformations.pcd` is a point cloud file holding a list of poses, which
 nothing else reads. Convert it to **TUM format**, one line per pose,
@@ -277,7 +288,7 @@ and shift using the transform the node already fitted, not another optimisation.
 
 ---
 
-## 9. Check it
+## 10. Check it
 
 ```bash
 python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
@@ -305,7 +316,7 @@ beginning. That's drift measured without any reference at all.
 
 ---
 
-## 10. Read what you ran
+## 11. Read what you ran
 
 - **`config/charlie8_gnss.yaml`** — every parameter has a comment saying why it's
   set that way. Start with `keyframeAddingDistThreshold`, `gnss/factorInterval`
