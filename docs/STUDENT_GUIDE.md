@@ -1,20 +1,21 @@
-# From a blank laptop to a running SLAM pipeline
+# Getting the pipeline running from scratch
 
-This walks you from an Ubuntu machine with **nothing installed — not even
-Docker** — to a finished ground truth trajectory produced by a LiDAR-inertial
-SLAM pipeline with GNSS in the loop.
+If you've never touched ROS before, start here. This takes you from a laptop
+with nothing installed on it, not even Docker, to a finished ground truth
+trajectory out of a LiDAR-inertial SLAM pipeline with GNSS wired into it.
 
-No prior ROS experience is assumed. You will type every command yourself;
-nothing here is a script that hides the work, because the point of the exercise
-is that next time you can do this to a pipeline nobody wrote a guide for.
+You'll type every command yourself. I could have wrapped all of this in one
+script, but then you'd learn nothing, and the next pipeline you have to install
+won't come with a guide.
 
-**Time:** about 15 minutes of typing, and roughly an hour of waiting the first
-time (compiling GTSAM and the SLAM code). After that, a run takes as long as the
-sequence lasts — 3 to 7 minutes.
+Budget about two hours for your first run. Only about fifteen minutes of that is
+you doing anything, the rest is waiting for stuff to compile, so line up
+something else to do. Once it's built, a run takes as long as the sequence
+lasts, so 3 to 7 minutes.
 
 ---
 
-## What you are going to build
+## What you're building
 
 ```
   /ouster0      32-beam LiDAR, 10 Hz  ──┐
@@ -31,10 +32,10 @@ sequence lasts — 3 to 7 minutes.
                                             (a trajectory in local ENU)
 ```
 
-The front-end is accurate over short distances but drifts over long ones. GNSS
-is the opposite: 0.5 m of noise, but no drift. The pose graph combines them, and
-the output is good enough to serve as *ground truth* for evaluating other
-algorithms — which is what it is used for.
+The front-end is very good locally and drifts over long distances. GNSS is the
+other way round: half a metre of noise on every fix, but it never drifts. Put
+both in a pose graph and you get something accurate enough to use as *ground
+truth* for testing other algorithms, which is the whole reason this exists.
 
 ---
 
@@ -43,44 +44,44 @@ algorithms — which is what it is used for.
 | | |
 |---|---|
 | OS | Ubuntu 20.04 / 22.04 / 24.04, 64-bit (x86_64) |
-| RAM | 16 GB recommended. 8 GB works — see the note in step 7 |
+| RAM | 16 GB is comfortable. 8 GB works, see the note in step 7 |
 | Disk | ~40 GB free (image 4.7 GB, bags 0.7–2.5 GB each, ~350 MB per run) |
-| Network | needed for steps 1, 4 and 5 |
-| ROS | **do not install it.** It lives in the container |
+| Network | for steps 1, 4 and 5 |
+| ROS | **don't install it.** It lives in the container |
 
-Check your architecture if you are unsure — an Apple-silicon Mac or an ARM
-laptop will not work here:
+If you're not sure what CPU you have, check. An M1/M2 Mac or an ARM laptop won't
+work here:
 
 ```bash
-uname -m          # must print x86_64
+uname -m          # has to say x86_64
 ```
 
 ---
 
-## 1. Install Docker Engine
+## 1. Install Docker
 
-Docker is what lets you run Ubuntu 20.04 and ROS Noetic on a laptop that is not
-Ubuntu 20.04. This pipeline needs ROS Noetic and GTSAM exactly 4.0.3; installing
-those on a modern system directly is painful and breaks other things. In a
-container it is reproducible and disposable.
+Docker is how you run Ubuntu 20.04 and ROS Noetic on a laptop that isn't Ubuntu
+20.04. This pipeline wants ROS Noetic and GTSAM 4.0.3 specifically. Installing
+those straight onto a modern system is miserable and tends to break other
+things you have. In a container you can throw it away and start again.
 
-Ubuntu ships a `docker.io` package that is usually out of date. Use Docker's own
-repository:
+Don't use the `docker.io` package from Ubuntu, it's usually ancient. Use
+Docker's own repo:
 
 ```bash
-# 1a. remove anything old that might conflict (fine if it prints nothing)
+# 1a. get rid of anything old that would conflict (fine if it finds nothing)
 for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
     sudo apt-get remove -y $pkg
 done
 
-# 1b. add Docker's signing key
+# 1b. Docker's signing key
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-# 1c. add the repository
+# 1c. the repo
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
 https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
   | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -91,80 +92,78 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
                         docker-buildx-plugin docker-compose-plugin
 ```
 
-> On Linux Mint or another Ubuntu derivative, `$VERSION_CODENAME` is the *Mint*
-> codename, which Docker does not publish. Replace it with the Ubuntu one:
+> On Mint or another Ubuntu spin, `$VERSION_CODENAME` gives you the Mint
+> codename, which Docker doesn't publish packages for. Swap in the Ubuntu one:
 > `$(. /etc/os-release && echo "$UBUNTU_CODENAME")`.
 
-**Then let your user run Docker without `sudo`.** Everything after this assumes
-you did:
+Now let yourself run Docker without `sudo`. Everything below assumes you've done
+this:
 
 ```bash
 sudo groupadd -f docker
 sudo usermod -aG docker $USER
-newgrp docker            # or log out and back in
+newgrp docker            # or just log out and back in
 ```
 
-Check it:
+Test it:
 
 ```bash
 docker run --rm hello-world
 ```
 
-You should see "Hello from Docker!". If you get
+If that prints "Hello from Docker!" you're good. If you get
 `permission denied while trying to connect to the Docker daemon socket`, the
-group change has not taken effect — log out and back in.
+group change hasn't kicked in yet, so log out and back in.
 
 ---
 
-## 2. Create your folders
+## 2. Make your folders
 
 ```bash
 mkdir -p ~/slam/catkin_ws/src ~/slam/datasets ~/slam/output
 ```
 
-Three folders, three jobs:
+Three folders, one job each:
 
-| Folder | Holds | Mounted in the container at |
+| Folder | What goes in it | Shows up in the container as |
 |---|---|---|
-| `~/slam/catkin_ws` | your **catkin workspace**: source code you clone, plus the `build/` and `devel/` trees the compiler produces | `/catkin_ws` |
-| `~/slam/datasets` | the `.bag` files your instructor gave you | `/datasets` (read-only) |
+| `~/slam/catkin_ws` | your **catkin workspace**: the code you clone, plus the `build/` and `devel/` folders the compiler makes | `/catkin_ws` |
+| `~/slam/datasets` | the `.bag` files you were given | `/datasets` (read-only) |
 | `~/slam/output` | trajectories, maps and logs the pipeline writes | `/output` |
 
-A *catkin workspace* is the ROS 1 convention for building code: every package
-you want to build goes in `src/`, and `catkin build` generates `build/` (object
-files) and `devel/` (the runnable result) next to it. You never create those two
-yourself.
+If you haven't used ROS 1 before: a *catkin workspace* is just the convention
+for where code gets built. Anything you want compiled goes in `src/`, and
+`catkin build` creates `build/` (object files) and `devel/` (the stuff you
+actually run) beside it. Don't make those two yourself, catkin does it.
 
-The folders live on your host, not inside the container. That means your work
-survives when the container exits — and you can edit the source with your normal
-editor while the container compiles it.
+All three folders live on your laptop, not inside the container. So your work
+survives when the container exits, and you can edit the code in VS Code or
+whatever you normally use while the container compiles it.
 
 ---
 
-## 3. Put the data in place
-
-Copy the `.bag` files you were given into `~/slam/datasets`:
+## 3. Copy the data in
 
 ```bash
 cp /path/to/usb/*.bag ~/slam/datasets/
 ls -lh ~/slam/datasets/
 ```
 
-The seven Charlie8 sequences, recorded from a vehicle with a 32-beam Ouster
-LiDAR, an XSENS IMU and a NovAtel GNSS receiver:
+These are the Charlie8 sequences, recorded off a vehicle carrying a 32-beam
+Ouster LiDAR, an XSENS IMU and a NovAtel GNSS receiver:
 
 | Sequence | Duration | Path | GNSS | Notes |
 |---|---|---|---|---|
-| `featuresAndGps` | 266 s | 433 m | yes | best conditioned — **start here** |
-| `field` | 154 s | 215 m | yes | shortest; open and sparse, so drift is visible |
-| `niceFeatures` | 263 s | 126 m | yes | returns to its start |
-| `ditches` | 387 s | 458 m | yes | longest; driven along side slopes |
+| `featuresAndGps` | 266 s | 433 m | yes | cleanest data, **start here** |
+| `field` | 154 s | 215 m | yes | shortest run. Open and sparse, so you can see the drift |
+| `niceFeatures` | 263 s | 126 m | yes | comes back to where it started |
+| `ditches` | 387 s | 458 m | yes | longest, and driven along side slopes |
 | `mixOfNicefeaturesAndOpenSpace` | 238 s | 215 m | yes | |
-| `twigs` | 254 s | 162 m | yes | fastest motion |
-| `insideGarage` | 227 s | 232 m | **none** | indoors: no GNSS fix at all. Runs differently — see step 8 |
+| `twigs` | 254 s | 162 m | yes | fastest driving |
+| `insideGarage` | 227 s | 232 m | **none** | indoors, so no GNSS fix at all. Runs differently, see step 8 |
 
-You do not need all seven. `field` is the quickest way to a result;
-`featuresAndGps` is the one that looks best.
+You don't need all of them. `field` gets you to a result fastest,
+`featuresAndGps` is the one that looks impressive in rviz.
 
 ---
 
@@ -176,23 +175,24 @@ git clone https://github.com/LouisThomasRoy/better_fastlio2.git
 cd better_fastlio2
 ```
 
-This is a fork of [better_fastlio2](https://github.com/Yixin-F/better_fastlio2)
-with GNSS support added. Look at what is different from the original — it is
-three commits:
+It's a fork of [better_fastlio2](https://github.com/Yixin-F/better_fastlio2)
+with the GNSS work added on top. If you want to see exactly what changed, it's
+only a few commits:
 
 ```bash
-git log --oneline -4
+git log --oneline -8
 ```
 
-Note where you cloned it: **inside `catkin_ws/src/`**. catkin only builds what it
-finds under `src/`. Cloning it to your Desktop is the single most common way to
-get "package not found" in step 8.
+Pay attention to *where* you cloned it: **inside `catkin_ws/src/`**. catkin only
+looks for packages under `src/`, so if you clone this to your Desktop or your
+home folder it will compile nothing and you'll get "package not found" in
+step 8 wondering why.
 
 ---
 
-## 5. Build the container image
+## 5. Build the Docker image
 
-From inside the repository you just cloned:
+Run this from inside the repo you just cloned:
 
 ```bash
 docker build -t bfl2-gnss:noetic \
@@ -200,46 +200,49 @@ docker build -t bfl2-gnss:noetic \
     docker/charlie8
 ```
 
-What this does, in order:
+Here's what it's doing while you wait:
 
-1. starts from the official ROS Noetic image (Ubuntu 20.04 + ROS + rviz);
-2. installs the C++ libraries the pipeline needs — Eigen, PCL, Boost,
+1. pulls the official ROS Noetic image (Ubuntu 20.04 + ROS + rviz);
+2. apt-installs the C++ libraries the pipeline needs: Eigen, PCL, Boost,
    GeographicLib, TBB;
-3. **compiles GTSAM 4.0.3 from source.** This is the factor-graph library the
-   pose graph is built on. It takes 15–30 minutes and is most of your wait;
+3. **compiles GTSAM 4.0.3 from source.** That's the factor graph library the
+   pose graph is built on, and it's 15 to 30 minutes of your life. This is the
+   bulk of the wait;
 4. builds two small ROS message packages the pipeline depends on
-   (`livox_ros_driver`, `darknet_ros_msgs`) into `/opt/deps_ws`, so your own
-   workspace stays clean;
-5. creates a user inside the container with **your** user ID, so files it writes
-   into your folders belong to you and not to root.
+   (`livox_ros_driver` and `darknet_ros_msgs`) into `/opt/deps_ws`, so they stay
+   out of your workspace;
+5. makes a user inside the container with the same UID as you, so everything it
+   writes into your folders belongs to you instead of root.
 
-`-t bfl2-gnss:noetic` is the name you are giving the image. The last argument,
-`docker/charlie8`, is the *build context* — the folder holding the `Dockerfile`.
+`-t bfl2-gnss:noetic` is just the name you're giving the image. The last
+argument, `docker/charlie8`, is the *build context*, meaning the folder the
+`Dockerfile` sits in.
 
-While it compiles, read [`docker/charlie8/Dockerfile`](../docker/charlie8/Dockerfile).
-Every non-obvious line has a comment explaining why it is there. That file is the
-answer to "how do I install this pipeline", written as code.
+Since you're stuck waiting anyway, open
+[`docker/charlie8/Dockerfile`](../docker/charlie8/Dockerfile) and read it. I
+commented every line that isn't obvious. That file is basically the answer to
+"how do I install this pipeline", except written as code so it can't go stale.
 
-When it finishes:
+When it's done:
 
 ```bash
 docker images | grep bfl2
 ```
 
-You only ever do this once. Rebuilding the *source* later does not mean
-rebuilding the image.
+You do this once, ever. Recompiling the SLAM code later does not mean rebuilding
+the image.
 
 ---
 
 ## 6. Start the container
 
-First, let containers draw windows on your screen — rviz needs this:
+rviz needs permission to draw on your screen, so first:
 
 ```bash
 xhost +local:docker
 ```
 
-Then start the container:
+Then:
 
 ```bash
 docker run -it --rm \
@@ -255,30 +258,30 @@ docker run -it --rm \
     bfl2-gnss:noetic
 ```
 
-Line by line:
+That's a lot of flags, so:
 
-| Flag | Why |
+| Flag | What it's for |
 |---|---|
-| `-it` | interactive terminal — you get a shell |
-| `--rm` | delete the container when you exit. Your files are on the host, so nothing is lost |
-| `--name bfl2` | so you can open a second terminal into it |
-| `--net=host` | share the host's network. ROS nodes talk to each other over TCP, and this keeps that simple |
-| `--shm-size=2g` | ROS moves point clouds through shared memory; the 64 MB default is not enough |
-| `-e DISPLAY` + `/tmp/.X11-unix` | the two halves of "let rviz open a window" |
-| `-v ~/slam/...:/...` | the three folders from step 2. **This is the passthrough**: `/datasets` inside the container *is* `~/slam/datasets` outside it |
-| `:ro` | the dataset mount is read-only, so nothing running inside can damage your data |
-| `--device /dev/dri` | hand the GPU to rviz. Drop this flag if it errors; rviz falls back to software rendering |
+| `-it` | interactive terminal, i.e. you get a shell |
+| `--rm` | throw the container away when you exit. All your files are on the host, so you lose nothing |
+| `--name bfl2` | lets you open a second terminal into it later |
+| `--net=host` | use the laptop's network. ROS nodes talk over TCP and this saves a lot of hassle |
+| `--shm-size=2g` | ROS passes point clouds through shared memory and Docker's 64 MB default isn't enough |
+| `-e DISPLAY` + `/tmp/.X11-unix` | the two halves of "rviz is allowed to open a window" |
+| `-v ~/slam/...:/...` | the three folders from step 2. **This is the passthrough:** `/datasets` inside the container *is* `~/slam/datasets` outside it |
+| `:ro` | the dataset mount is read-only so nothing in the container can wreck your data. There's a reason for this, see step 8 |
+| `--device /dev/dri` | gives rviz your GPU. If it complains, drop this flag and rviz will fall back to software rendering |
 
-You are now at a prompt inside the container. Your host is untouched — nothing
-you do in here installs anything on your laptop.
+You should now be at a prompt inside the container. Nothing you do in here
+touches your actual laptop.
 
-> Later, `./docker/charlie8/run_container.sh` runs exactly this command for you,
-> and attaches a second shell if the container is already up. Use it once you
-> understand what it is doing.
+> Once you've done this a few times, `./docker/charlie8/run_container.sh` runs
+> the same thing for you, and if the container is already up it just opens
+> another shell in it. Learn the long version first though.
 
 ---
 
-## 7. Build the SLAM source
+## 7. Compile the SLAM code
 
 Inside the container:
 
@@ -287,155 +290,159 @@ cd /catkin_ws
 catkin build fast_lio_sam -j"$(nproc)"
 ```
 
-`fast_lio_sam` is the *package* name — `better_fastlio2` is only the folder the
-repository lives in. You will see this mismatch again in step 8.
+Note the name. The *package* is called `fast_lio_sam`, `better_fastlio2` is only
+the folder the repo lives in. That trips people up, and you'll hit it again in
+step 8.
 
-This compiles for 3–15 minutes depending on how many cores you have.
-`laserMapping.cpp` alone is a 2500-line translation unit full of Eigen and PCL
-templates.
+This takes 3 to 15 minutes depending on your core count. `laserMapping.cpp` on
+its own is 2500 lines of Eigen and PCL templates, so it's slow to compile.
 
-> **8 GB of RAM or less:** use `-j4` instead of `-j"$(nproc)"`. Each parallel
-> compiler process can take over a gigabyte, and if the kernel's OOM killer
-> stops one you get a confusing "signal 9" error rather than a clear message.
+> **If you have 8 GB of RAM or less,** use `-j4` instead of `-j"$(nproc)"`. Each
+> compiler process can eat over a gigabyte, and when the OOM killer takes one
+> out you get a cryptic "signal 9" instead of anything useful.
 
-The build is a **Release** build — `CMakeLists.txt` defaults to it. That is not a
-detail: at `-O0` this node runs about four times slower than real time, and the
-way you find out is not an error but a trajectory that quietly stops a third of
-the way through the sequence. If you ever build it elsewhere, pass
-`--cmake-args -DCMAKE_BUILD_TYPE=Release` yourself.
+This is a **Release** build, which `CMakeLists.txt` now sets by default. Don't
+undo that. At `-O0` the node runs roughly four times slower than real time, and
+you don't get an error about it. What you get is a trajectory that quietly stops
+a third of the way through the sequence and looks fine until you check its
+length. I burned a run on exactly that. If you ever build this somewhere else,
+pass `--cmake-args -DCMAKE_BUILD_TYPE=Release` yourself.
 
-When it succeeds, tell your current shell where the result is:
+Once it's built, point your current shell at the result:
 
 ```bash
 source devel/setup.bash
 ```
 
-You have to do this because the shell was started *before* `devel/` existed. New
-shells pick it up automatically. Check:
+You need this because you opened that shell before `devel/` existed. Any new
+shell picks it up on its own. Check it worked:
 
 ```bash
-rospack find fast_lio_sam        # /catkin_ws/src/better_fastlio2
+rospack find fast_lio_sam        # should print /catkin_ws/src/better_fastlio2
 ```
 
 ---
 
 ## 8. Run it
 
-### First, look at the data
+### Look at the data first
 
 ```bash
 rosbag info /datasets/field.bag
 ```
 
-A ROS bag is a recording of *topics* — named streams of timestamped messages.
-You should see `/ouster0` (the LiDAR, ~1540 messages at 10 Hz), `/imu` (100 Hz)
-and `/gps/odom_enu` (20 Hz). Those three are exactly what the pipeline
-subscribes to.
+A bag is a recording of *topics*, which are named streams of timestamped
+messages. You should see `/ouster0` (the LiDAR, 1540 messages at 10 Hz), `/imu`
+(15401 of them, 100 Hz) and `/gps/odom_enu` (3080, 20 Hz). Those three are what
+the pipeline actually subscribes to. The others are along for the ride.
 
-### Terminal 1 — start the pipeline
+### Terminal 1: start the pipeline
 
 ```bash
 roslaunch fast_lio_sam mapping_charlie8.launch seq:=field
 ```
 
 `roslaunch` reads [`launch/mapping_charlie8.launch`](../launch/mapping_charlie8.launch),
-which loads [`config/charlie8_gnss.yaml`](../config/charlie8_gnss.yaml) into the
-parameter server, starts the mapping node, and starts rviz. It also starts
-`roscore` — the name server every ROS node registers with — because none is
-running yet.
+dumps [`config/charlie8_gnss.yaml`](../config/charlie8_gnss.yaml) into the
+parameter server, starts the mapping node and opens rviz. It also starts
+`roscore` for you, which is the name server every ROS node has to register with.
 
-rviz opens and shows nothing at first. That is correct: nothing is publishing
-yet.
+rviz will be empty at first. That's fine, nothing is publishing yet.
 
-> ⚠️ **The node deletes `/output/field/` when it starts.** Not a typo, and not
-> optional: `fsmkdir()` calls `fs::remove_all()` on its output directory before
-> recreating it. Never point `outdir:=` at a folder holding anything you want to
-> keep. This is also why `/datasets` is mounted read-only.
+> ⚠️ **Heads up: the node deletes `/output/field/` on startup.** That's not a
+> bug and it's not avoidable. `fsmkdir()` calls `fs::remove_all()` on its output
+> folder before recreating it, every single time the node starts. Never point
+> `outdir:=` at anything you care about. It's also why `/datasets` is mounted
+> read-only, because a typo there would take your bags with it.
 
-### Terminal 2 — play the bag
+### Terminal 2: play the bag
 
-Open a second terminal **on your host**, and attach it to the running container:
+Open a second terminal **on your laptop** and jump into the container that's
+already running:
 
 ```bash
 docker exec -it bfl2 bash
 ```
 
-Then, inside:
+Then:
 
 ```bash
 rosbag play /datasets/field.bag
 ```
 
-Now watch terminal 1 and rviz. You should see:
+Now go watch terminal 1 and rviz. You should get:
 
-- a white point cloud building up into a recognisable scene;
-- a coloured trajectory line growing behind the sensor;
-- lines in terminal 1 reporting keyframes and, once about 30 m have been driven,
-  a message about the GNSS alignment being solved.
+- a white point cloud filling in something that looks like a real place;
+- a coloured line trailing behind the sensor, which is the trajectory;
+- keyframe messages scrolling past in terminal 1, and after about 30 m of
+  driving, a line about the GNSS alignment being solved.
 
-`field` plays for 154 seconds in real time. Let it finish.
+`field` plays for 154 seconds at real speed. Let it run.
 
-Terminal 1 prints a `[ Mapping Time ]` line per scan. The `ave total` field is
-seconds of processing per 0.1 s scan — it should sit **well under 0.1**. If it
-is larger, the node is falling behind the bag and will end up with a trajectory
-shorter than the sequence.
+While it does, look at the `[ Mapping Time ]` lines in terminal 1. The
+`ave total` number is how many seconds of processing each 0.1 s scan costs, so
+it needs to stay **well under 0.1**. Mine sits around 0.015. If yours is bigger
+than 0.1, the node can't keep up with the bag and you're going to end up with a
+trajectory shorter than the sequence.
 
-> **Do not add `--clock` to `rosbag play`**, and do not set `use_sim_time`. The
-> node's main loop sleeps on wall time; under simulated time those sleeps never
-> return once the bag ends, and the save step below will hang forever.
+> **Don't add `--clock` to `rosbag play`** and don't set `use_sim_time`. The
+> node's main loop sleeps on wall time. Under simulated time those sleeps never
+> wake up once the bag ends, so the save below will just hang there forever.
 
-### Terminal 2 — save the result
+### Terminal 2: save it
 
-When playback ends, **wait about 30 seconds**. The pose graph optimiser and the
-loop-closure thread run behind the front-end and are still catching up; saving
-early gives you a truncated trajectory. Then:
+When the bag finishes, **wait about 30 seconds** before doing anything. The pose
+graph and the loop-closure thread run behind the front-end and they're still
+catching up. Save too early and you cut the end off your own trajectory. Then:
 
 ```bash
 rosservice call /save_map "{resolution: 0.0, destination: ''}"
 ```
 
-This is a *service call* — a request/response to the running node, as opposed to
-the streaming topics. It writes the results out. Nothing is saved automatically:
-if you kill the node without this call, the whole run is lost.
+That's a *service call*, which is a one-off request to a running node, as
+opposed to the topics that stream continuously. Nothing gets saved on its own,
+so if you Ctrl-C the node without calling this, the entire run is gone.
 
-Check what landed:
+See what you got:
 
 ```bash
 ls -lh /output/field/
 ```
 
-| File | What |
+| File | What it is |
 |---|---|
-| `transformations.pcd` | **the one that matters** — every keyframe pose with its timestamp |
-| `map_from_enu.txt` | the ENU→map transform the GNSS code fitted, and how many factors it added |
-| `GlobalMap.pcd` | the accumulated point cloud (~300 MB) |
-| `LOG/`, `SCDs/`, `PCDs/` | diagnostics |
+| `transformations.pcd` | **the important one.** Every keyframe pose with its timestamp |
+| `map_from_enu.txt` | the ENU→map transform the GNSS code fitted, plus how many factors it ended up using |
+| `GlobalMap.pcd` | the whole accumulated point cloud, around 300 MB |
+| `LOG/`, `SCDs/`, `PCDs/` | diagnostics, ignore them for now |
 
-Then stop the node in terminal 1 with `Ctrl-C`.
+Ctrl-C the node in terminal 1 when you're done.
 
-### The exception: insideGarage
+### insideGarage is different
 
-That sequence was recorded indoors and has no GNSS fix at all — `/gps` is
-present but every field is zero. With no global position sensor, loop closure
-becomes the only thing that can correct drift, so the two switch places:
+That one was recorded indoors, so there's no GNSS fix anywhere in it. The `/gps`
+topic is there but every field is zero. With no global sensor, loop closure is
+the only thing left that can pull the drift back, so the two swap places:
 
 ```bash
 roslaunch fast_lio_sam mapping_charlie8.launch seq:=insideGarage \
     gnss:=false loop:=true
 ```
 
-They are alternatives rather than complements: with both enabled the optimiser
-satisfies neither constraint. The reasoning, with numbers, is in the comments of
-`config/charlie8_gnss.yaml` — worth reading, because it is a good example of a
-result that is not obvious in advance.
+You can't just turn both on, which is the interesting part. With GNSS and loop
+closure both active the optimiser ends up satisfying neither of them and the
+result is worse than either alone. The numbers behind that are in the comments
+in `config/charlie8_gnss.yaml`. Go read them, it's a good example of something
+you would never guess from first principles.
 
 ---
 
-## 9. Turn the result into a trajectory file
+## 9. Make a trajectory file out of it
 
-`transformations.pcd` is a point cloud file being used as a pose list, which is
-awkward to work with. Convert it to **TUM format** — one line per pose,
-`timestamp x y z qx qy qz qw`, which every SLAM evaluation tool reads:
+`transformations.pcd` is a point cloud file being abused as a list of poses,
+which nothing else knows how to read. Convert it to **TUM format** instead, one
+line per pose, `timestamp x y z qx qy qz qw`. Every SLAM evaluation tool on
+earth reads that:
 
 ```bash
 python3 /catkin_ws/src/better_fastlio2/tools/anchor/keyposes_to_tum.py \
@@ -444,129 +451,134 @@ python3 /catkin_ws/src/better_fastlio2/tools/anchor/keyposes_to_tum.py \
     --enu /output/field/map_from_enu.txt
 ```
 
-`--enu` additionally rotates the trajectory out of the SLAM frame (whose origin
-and heading are wherever the vehicle happened to start) into **local ENU** —
-x east, y north, z up. That is a rigid change of coordinates using the transform
-the node already fitted, not another optimisation.
+`--enu` also spins the trajectory out of the SLAM frame (whose origin and
+heading are just wherever the vehicle happened to be sitting when you hit play)
+into **local ENU**, so x is east, y is north, z is up. No optimisation happens
+here, it's a rigid rotation and shift using the transform the node already
+worked out during the run.
 
-It prints a summary and writes `ground_truth.tum` plus a `.json` alongside it
-recording how many GNSS factors were used.
+You get a summary printed, plus `ground_truth.tum` and a `.json` beside it
+saying how many GNSS factors went in.
 
 ---
 
-## 10. Check your answer
+## 10. Check you didn't get garbage
 
 ```bash
 python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
     /output/field/ground_truth.tum
 ```
 
-Sanity checks first: `field` should report about **1500 poses, 154 s, ~215 m**.
-Check all three. A span much shorter than 154 s means the node fell behind and
-the trajectory is truncated; a path length that is wildly wrong — 20 m, or
-2000 m — means the run diverged.
+For `field` you want roughly **1500 poses, 154 s, ~215 m**. Look at all three
+numbers, not just one. A span much shorter than 154 s means the node fell behind
+and your trajectory got cut off. A path length that's obviously wrong, like 20 m
+or 2000 m, means the run diverged and you should just do it again.
 
-If your instructor gave you reference trajectories, compare against one:
+If you were given reference trajectories, compare against one:
 
 ```bash
 python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
     /output/field/ground_truth.tum --compare /datasets/reference/field.tum
 ```
 
-Expect an RMSE of a few centimetres — a clean `field` run lands around 0.05 m
-against the reference, with a worst-case pose error near 0.13 m. It will **not**
-be zero: the node is not deterministic — thread scheduling changes which scans
-arrive together — so two runs of the same sequence differ slightly. Agreement
-well under a metre is a pass.
+You're looking for an RMSE of a few centimetres. A clean `field` run comes in
+around 0.05 m with the worst single pose about 0.13 m off. It won't be zero and
+it shouldn't be: the node isn't deterministic, because thread scheduling changes
+which scans get batched together, so no two runs match exactly. Anything well
+under a metre is fine.
 
-For the four sequences that return to their starting point (`ditches`,
-`featuresAndGps`, `insideGarage`, `niceFeatures`), add `--loop` to see how far
-the end of the trajectory lands from the beginning. That number is drift you can
-measure without any reference at all.
+Four of the sequences come back to where they started (`ditches`,
+`featuresAndGps`, `insideGarage`, `niceFeatures`). For those, add `--loop` and
+it'll tell you how far the end of your trajectory landed from the beginning.
+That's drift you can measure without needing a reference at all, which is handy.
 
 ---
 
-## 11. What you actually ran
+## 11. Now go read what you just ran
 
-Now that it works, read the parts you skipped. In rough order of usefulness:
+It works, so this is the part where you find out what you did. Roughly in order
+of how much you'll get out of it:
 
-**`config/charlie8_gnss.yaml`** — every parameter, with a comment explaining why
-it has the value it has. Start with `keyframeAddingDistThreshold`,
+**`config/charlie8_gnss.yaml`.** Every parameter has a comment saying why it's
+set the way it is. Start with `keyframeAddingDistThreshold`,
 `gnss/factorInterval` and `gnss/looseCoupling`.
 
-**`launch/mapping_charlie8.launch`** — how a launch file wires up parameters and
-nodes, and why `use_sim_time` is deliberately absent.
+**`launch/mapping_charlie8.launch`.** How a launch file hooks up parameters and
+nodes, and why `use_sim_time` is missing on purpose.
 
-**`src/laserMapping.cpp`** — search for `addGPSFactor`. Around 340 lines starting
-at the `GNSS` banner comment are this fork's; the rest is upstream. See
-[GNSS_FACTOR.md](GNSS_FACTOR.md) for the design.
+**`src/laserMapping.cpp`.** Search for `addGPSFactor`. The ~340 lines under the
+`GNSS` banner comment are the ones this fork added, everything else is upstream.
+[GNSS_FACTOR.md](GNSS_FACTOR.md) explains the design if you want the reasoning.
 
-### Things to try
+### Stuff worth trying
 
-1. **Turn GNSS off** and see how much it was doing:
-   `roslaunch fast_lio_sam mapping_charlie8.launch seq:=field gnss:=false`
-   then compare the two trajectories with `validate.py --compare`. On `field`
-   the difference is metres.
-2. **Break the de-skewing.** Set `time_unit: 2` in the config and re-run. Nothing
-   errors; the trajectory just gets worse. Working out *why* from the config
-   comments is the exercise.
-3. **Run the same sequence twice** without changing anything and compare. The
-   difference between the two runs is your repeatability, and it is the honest
-   lower bound on any accuracy you claim.
-4. **Watch the topics live** while a run is going, from a third terminal:
+1. **Turn GNSS off** and see what it was actually buying you:
+   `roslaunch fast_lio_sam mapping_charlie8.launch seq:=field gnss:=false`, then
+   compare the two with `validate.py --compare`. On `field` they're metres
+   apart.
+2. **Break the de-skewing on purpose.** Set `time_unit: 2` in the config and run
+   it again. Nothing will error, the trajectory just gets worse. Figuring out
+   why from the config comments is the exercise.
+3. **Run the same sequence twice** and change nothing. However much the two runs
+   disagree is your repeatability, and you can't honestly claim any accuracy
+   better than that.
+4. **Poke at the topics while it's running,** from a third terminal:
    `rostopic hz /ouster0`, `rostopic echo -n1 /gps/odom_enu`,
    `rosnode info /laserMapping`.
 
 ---
 
-## Troubleshooting
+## When it breaks
 
 **`permission denied ... /var/run/docker.sock`**
-The group change from step 1 has not taken effect. Log out and back in.
+The docker group change from step 1 hasn't taken effect. Log out, log back in.
 
-**rviz does not open / `cannot open display`**
-Run `xhost +local:docker` on the *host* before starting the container. If you
-are on Wayland (Ubuntu 22.04+ default), this still works through XWayland.
+**rviz won't open, or `cannot open display`**
+You forgot `xhost +local:docker` on the host before starting the container. It
+works fine on Wayland too (Ubuntu 22.04 and up), through XWayland.
 
-**`libGL error: failed to load driver: iris` (or `i915`), or rviz is black**
-The container's graphics driver does not match your GPU. Force software
-rendering — slower, but always works. Add to `docker run`:
-`-e LIBGL_ALWAYS_SOFTWARE=1`, and drop `--device /dev/dri`.
+**`libGL error: failed to load driver: iris` (or `i915`), or rviz is just black**
+The container's graphics driver doesn't match your GPU. Force software
+rendering, which is slower but always works: add `-e LIBGL_ALWAYS_SOFTWARE=1` to
+your `docker run` and drop `--device /dev/dri`.
 
 **`[rospack] Error: package 'fast_lio_sam' not found`**
-Either you did not `source /catkin_ws/devel/setup.bash` in this shell, or you
-cloned the repository somewhere other than `~/slam/catkin_ws/src/`.
+Either you didn't `source /catkin_ws/devel/setup.bash` in this particular shell,
+or you cloned the repo somewhere other than `~/slam/catkin_ws/src/`. It's
+almost always the second one.
 
-**`catkin build` fails with `c++: fatal error: Killed signal terminated`**
-Out of memory. Rebuild with `-j4`, or `-j2`.
+**`catkin build` dies with `c++: fatal error: Killed signal terminated`**
+You ran out of RAM. Try `-j4`, or `-j2`.
 
 **`RLException: Unable to contact my own server`**
-ROS cannot resolve its own hostname. You started the container without
-`--net=host`; use the command in step 6 as written.
+ROS can't resolve its own hostname. You started the container without
+`--net=host`. Use the command in step 6 exactly as written.
 
-**The bag finishes but `/save_map` hangs**
-You played the bag with `--clock`, or something set `use_sim_time`. Kill it,
-start again without.
+**The bag finishes and `/save_map` just hangs**
+You played it with `--clock`, or something set `use_sim_time`. Kill it and run
+it again without.
 
-**`transformations.pcd` missing after `/save_map`**
-The node was killed before the call, or the call errored. Check terminal 1.
-Remember the node wipes its output directory at startup, so a *previous* run's
-files are gone by then too.
+**No `transformations.pcd` after `/save_map`**
+Either the node died before you called it, or the call errored. Look at
+terminal 1. And remember the node wipes its output folder on startup, so if you
+already restarted it, the previous run's files are gone too.
 
-**The trajectory is much shorter than the sequence**
-The node fell behind `rosbag play` and `/save_map` captured only what it had
-finished. Check `ave total` in terminal 1 (see step 8) and confirm the build is
-a Release build:
+**The trajectory is way shorter than the sequence**
+The node fell behind `rosbag play` and `/save_map` only got what it had
+finished. Check `ave total` in terminal 1 (step 8), and make sure you're on a
+Release build:
 `grep CMAKE_BUILD_TYPE /catkin_ws/build/fast_lio_sam/CMakeCache.txt`.
-Close other heavy applications and re-run — the node has to keep real time.
+Close whatever else is chewing your CPU and run it again.
 
-**The trajectory is ten times too long, or wanders off**
-Usually the wrong sequence config, or a bag that is not one of the seven. Check
-`rosbag info` shows `/ouster0` and `/imu` with the message counts you expect.
+**The trajectory is ten times too long, or wanders off into nowhere**
+Usually the wrong config for that sequence, or a bag that isn't one of these
+seven. Check `rosbag info` shows `/ouster0` and `/imu` with sensible message
+counts.
 
-**Disk fills up**
-`GlobalMap.pcd` is ~300 MB per run and `/output/<seq>/` is wiped on the next run
-of the *same* sequence, but not of a different one. Delete what you do not need.
+**You're out of disk**
+`GlobalMap.pcd` is ~300 MB per run. `/output/<seq>/` gets wiped when you re-run
+*that* sequence, but not when you run a different one, so they pile up. Delete
+what you don't need.
 
 ---
 
@@ -575,12 +587,12 @@ of the *same* sequence, but not of a different one. Delete what you do not need.
 ```bash
 # on the host
 xhost +local:docker
-./docker/charlie8/run_container.sh          # start, or attach another shell
+./docker/charlie8/run_container.sh          # start it, or open another shell in it
 
 # in the container, once
 cd /catkin_ws && catkin build fast_lio_sam -j"$(nproc)" && source devel/setup.bash
 
-# per sequence: terminal 1
+# per sequence, terminal 1
 roslaunch fast_lio_sam mapping_charlie8.launch seq:=SEQ
 #           insideGarage only:  ... seq:=insideGarage gnss:=false loop:=true
 
@@ -589,7 +601,7 @@ rosbag play /datasets/SEQ.bag
 sleep 30
 rosservice call /save_map "{resolution: 0.0, destination: ''}"
 
-# terminal 2, after
+# terminal 2, afterwards
 python3 /catkin_ws/src/better_fastlio2/tools/anchor/keyposes_to_tum.py \
     /output/SEQ/transformations.pcd /output/SEQ/ground_truth.tum \
     --enu /output/SEQ/map_from_enu.txt
