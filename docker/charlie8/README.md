@@ -37,8 +37,8 @@ walks through the command it replaces — learn that first.
 ## `Dockerfile.tools` — the converter
 
 Python only, no ROS. Converts the raw `.db3` sequences into the ROS 1 bags the
-pipeline consumes. You need this only if you were given raw data; see
-[`../../docs/INSTRUCTOR_NOTES.md`](../../docs/INSTRUCTOR_NOTES.md).
+pipeline consumes. You only need it if you were given raw `.db3` data rather than
+bags; the converter's own header documents what it fixes and why.
 
 ```bash
 docker build -t bfl2-tools -f docker/charlie8/Dockerfile.tools docker/charlie8

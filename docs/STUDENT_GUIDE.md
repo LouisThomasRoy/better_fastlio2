@@ -1,11 +1,12 @@
 # Getting the pipeline running from scratch
 
-From a laptop with nothing installed on it, not even Docker, to a finished
-ground truth trajectory. No ROS experience needed.
+From a bare Ubuntu machine to a finished ground truth trajectory. No ROS
+experience needed. Everything except Docker itself lives in the container.
+Should take around 2h to install for the first time.
 
-Budget two hours the first time. Fifteen minutes of that is you typing, the rest
-is waiting for things to compile. After that a run takes as long as the sequence,
-so 3 to 7 minutes.
+Check Docker works before you start: `docker run --rm hello-world`. If that says
+`permission denied ... docker.sock`, you're not in the `docker` group yet:
+`sudo usermod -aG docker $USER`, then log out and back in.
 
 ---
 
@@ -27,71 +28,12 @@ so 3 to 7 minutes.
 ```
 
 The front-end is accurate locally and drifts over distance. GNSS is the other way
-round: half a metre of noise, no drift. Together they're accurate enough to use
+round, half a metre of noise, no drift. Together they're accurate enough to use
 as *ground truth* for testing other algorithms.
 
 ---
 
-## 0. What you need
-
-| | |
-|---|---|
-| OS | Ubuntu 20.04 / 22.04 / 24.04, 64-bit (x86_64) |
-| RAM | 16 GB. 8 GB works, see step 7 |
-| Disk | ~40 GB free (image 4.7 GB, bags 0.7–2.5 GB each, ~350 MB per run) |
-| Network | for steps 1, 4 and 5 |
-| ROS | **don't install it.** It lives in the container |
-
-`uname -m` has to say `x86_64`. An M1/M2 Mac or an ARM laptop won't work.
-
----
-
-## 1. Install Docker
-
-Ubuntu's `docker.io` package is usually too old. Use Docker's own repo:
-
-```bash
-# clear out anything old (fine if it finds nothing)
-for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
-    sudo apt-get remove -y $pkg
-done
-
-# signing key
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-# repo, then install
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
-                        docker-buildx-plugin docker-compose-plugin
-```
-
-> On Mint, `$VERSION_CODENAME` gives the Mint codename, which Docker doesn't
-> publish. Use `$(. /etc/os-release && echo "$UBUNTU_CODENAME")`.
-
-Then let yourself run Docker without `sudo`. Everything below assumes this:
-
-```bash
-sudo groupadd -f docker
-sudo usermod -aG docker $USER
-newgrp docker            # or log out and back in
-
-docker run --rm hello-world
-```
-
-If that fails with `permission denied ... docker.sock`, the group change hasn't
-taken effect. Log out and back in.
-
----
-
-## 2. Make your folders
+## 1. Make your folders
 
 ```bash
 mkdir -p ~/slam/catkin_ws/src ~/slam/datasets ~/slam/output
@@ -110,14 +52,14 @@ the container exiting and you can edit the code in your normal editor.
 
 ---
 
-## 3. Copy the data in
+## 2. Copy the data in
 
 ```bash
 cp /path/to/usb/*.bag ~/slam/datasets/
 ```
 
 Recorded off a vehicle with a 32-beam Ouster LiDAR, an XSENS IMU and a NovAtel
-GNSS receiver. You need two of these, not all seven.
+GNSS receiver.
 
 | Sequence | Duration | Path | GNSS | Notes |
 |---|---|---|---|---|
@@ -127,11 +69,11 @@ GNSS receiver. You need two of these, not all seven.
 | `ditches` | 387 s | 458 m | yes | longest, driven along side slopes |
 | `mixOfNicefeaturesAndOpenSpace` | 238 s | 215 m | yes | |
 | `twigs` | 254 s | 162 m | yes | fastest driving |
-| `insideGarage` | 227 s | 232 m | **none** | indoors, no GNSS fix. Runs differently, see step 8 |
+| `insideGarage` | 227 s | 232 m | **none** | indoors, no GNSS fix. Runs differently, see step 7 |
 
 ---
 
-## 4. Clone the pipeline
+## 3. Clone the pipeline
 
 ```bash
 cd ~/slam/catkin_ws/src
@@ -145,11 +87,11 @@ GNSS work added.
 
 ⚠️ Clone it **inside `catkin_ws/src/`**. catkin only looks for packages under
 `src/`, so anywhere else builds nothing and you get "package not found" in
-step 8.
+step 7.
 
 ---
 
-## 5. Build the container image
+## 4. Build the container image
 
 From inside the repo:
 
@@ -172,7 +114,7 @@ image.
 
 ---
 
-## 6. Start the container
+## 5. Start the container
 
 ```bash
 xhost +local:docker          # let the container draw rviz on your screen
@@ -197,8 +139,8 @@ docker run -it --rm \
 | `--net=host` | ROS nodes talk over TCP; this saves a lot of hassle |
 | `--shm-size=2g` | ROS moves point clouds through shared memory, 64 MB isn't enough |
 | `-e DISPLAY` + `/tmp/.X11-unix` | the two halves of "rviz can open a window" |
-| `-v ~/slam/...:/...` | the folders from step 2. **This is the passthrough:** `/datasets` in the container *is* `~/slam/datasets` outside |
-| `:ro` | dataset mount read-only, so nothing inside can wreck your data. See step 8 |
+| `-v ~/slam/...:/...` | the folders from step 1. **This is the passthrough:** `/datasets` in the container *is* `~/slam/datasets` outside |
+| `:ro` | dataset mount read-only, so nothing inside can wreck your data. See step 7 |
 | `--device /dev/dri` | gives rviz your GPU. Drop it if it errors and rviz falls back to software rendering |
 
 Later on, `./docker/charlie8/run_container.sh` does all of that, and opens
@@ -206,7 +148,7 @@ another shell if the container is already up.
 
 ---
 
-## 7. Compile the SLAM code
+## 6. Compile the SLAM code
 
 ```bash
 cd /catkin_ws
@@ -216,7 +158,7 @@ rospack find fast_lio_sam        # /catkin_ws/src/better_fastlio2
 ```
 
 The *package* is `fast_lio_sam`; `better_fastlio2` is just the folder. You'll hit
-that again in step 8.
+that again in step 7.
 
 3 to 15 minutes depending on cores. **With 8 GB of RAM or less use `-j4`** — each
 compiler process can take over a gigabyte, and an OOM kill shows up as a cryptic
@@ -232,7 +174,7 @@ fine until you check its length. I lost a run to this.
 
 ---
 
-## 8. Run it
+## 7. Run it
 
 ### Look at the data
 
@@ -316,7 +258,7 @@ the comments in `config/charlie8_gnss.yaml`.
 
 ---
 
-## 9. Make a trajectory file
+## 8. Make a trajectory file
 
 `transformations.pcd` is a point cloud file holding a list of poses, which
 nothing else reads. Convert it to **TUM format**, one line per pose,
@@ -335,7 +277,7 @@ and shift using the transform the node already fitted, not another optimisation.
 
 ---
 
-## 10. Check it
+## 9. Check it
 
 ```bash
 python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
@@ -363,7 +305,7 @@ beginning. That's drift measured without any reference at all.
 
 ---
 
-## 11. Read what you ran
+## 10. Read what you ran
 
 - **`config/charlie8_gnss.yaml`** — every parameter has a comment saying why it's
   set that way. Start with `keyframeAddingDistThreshold`, `gnss/factorInterval`
@@ -374,82 +316,3 @@ beginning. That's drift measured without any reference at all.
   `GNSS` banner are this fork's, the rest is upstream.
   [GNSS_FACTOR.md](GNSS_FACTOR.md) has the reasoning.
 
-### Worth trying
-
-1. **Turn GNSS off:** `... seq:=field gnss:=false`, then `validate.py --compare`
-   against your first run. On `field` they're metres apart.
-2. **Break the de-skewing:** set `time_unit: 2` and re-run. Nothing errors, the
-   trajectory just gets worse. Work out why from the config comments.
-3. **Run the same sequence twice** unchanged. The disagreement is your
-   repeatability, and you can't claim accuracy better than it.
-4. **Watch the topics live** from a third terminal: `rostopic hz /ouster0`,
-   `rostopic echo -n1 /gps/odom_enu`, `rosnode info /laserMapping`.
-
----
-
-## When it breaks
-
-**`permission denied ... docker.sock`** — docker group change hasn't taken
-effect. Log out and back in.
-
-**rviz won't open / `cannot open display`** — you forgot `xhost +local:docker` on
-the host. Works on Wayland too, through XWayland.
-
-**`libGL error: failed to load driver: iris`, or rviz is black** — driver
-mismatch. Add `-e LIBGL_ALWAYS_SOFTWARE=1` and drop `--device /dev/dri`.
-
-**`package 'fast_lio_sam' not found`** — you didn't source
-`devel/setup.bash` in this shell, or you cloned outside `~/slam/catkin_ws/src/`.
-Usually the second.
-
-**`c++: fatal error: Killed signal terminated`** — out of RAM. Use `-j4` or
-`-j2`.
-
-**`RLException: Unable to contact my own server`** — you started the container
-without `--net=host`.
-
-**`/save_map` hangs** — you played the bag with `--clock`, or something set
-`use_sim_time`.
-
-**No `transformations.pcd` after `/save_map`** — the node died before the call,
-or the call errored; check terminal 1. If you restarted the node since, the
-previous run's files are gone too.
-
-**Trajectory much shorter than the sequence** — the node fell behind. Check
-`ave total`, confirm
-`grep CMAKE_BUILD_TYPE /catkin_ws/build/fast_lio_sam/CMakeCache.txt` says
-Release, close whatever else is using your CPU, re-run.
-
-**Trajectory ten times too long, or wandering off** — wrong config for that
-sequence, or a bag that isn't one of these seven. Check `rosbag info`.
-
-**Out of disk** — `GlobalMap.pcd` is ~300 MB per run, and `/output/<seq>/` is
-only wiped when you re-run *that* sequence.
-
----
-
-## Cheat sheet
-
-```bash
-# on the host
-xhost +local:docker
-./docker/charlie8/run_container.sh          # start it, or open another shell in it
-
-# in the container, once
-cd /catkin_ws && catkin build fast_lio_sam -j"$(nproc)" && source devel/setup.bash
-
-# per sequence, terminal 1
-roslaunch fast_lio_sam mapping_charlie8.launch seq:=SEQ
-#           insideGarage only:  ... seq:=insideGarage gnss:=false loop:=true
-
-# terminal 2
-rosbag play /datasets/SEQ.bag
-sleep 30
-rosservice call /save_map "{resolution: 0.0, destination: ''}"
-
-python3 /catkin_ws/src/better_fastlio2/tools/anchor/keyposes_to_tum.py \
-    /output/SEQ/transformations.pcd /output/SEQ/ground_truth.tum \
-    --enu /output/SEQ/map_from_enu.txt
-python3 /catkin_ws/src/better_fastlio2/tools/eval/validate.py \
-    /output/SEQ/ground_truth.tum
-```

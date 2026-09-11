@@ -20,9 +20,9 @@ the configuration and launch file for it.
 
 ## New here? Start with the guide
 
-**[docs/STUDENT_GUIDE.md](docs/STUDENT_GUIDE.md)** takes you from a laptop with
-nothing installed — not even Docker — to a finished ground truth trajectory. It
-assumes no ROS experience.
+**[docs/STUDENT_GUIDE.md](docs/STUDENT_GUIDE.md)** takes you from a bare Ubuntu
+machine with Docker on it to a finished ground truth trajectory. It assumes no
+ROS experience.
 
 Once you know the moves:
 
@@ -90,7 +90,7 @@ Everything upstream ships is where upstream put it. What this fork adds:
 | `tools/anchor/keyposes_to_tum.py` | `transformations.pcd` → TUM, and the rigid map→ENU change of coordinates |
 | `tools/eval/validate.py` | GNSS residual, loop closure error, comparison against a reference |
 | `tools/preproc/` | `.db3` → ROS 1 bag conversion (only needed if you have raw data) |
-| `docs/` | student guide, GNSS design notes, instructor notes |
+| `docs/` | student guide, GNSS design notes |
 | `README_upstream.md` | upstream's original README, unchanged |
 
 ## Licence and attribution
